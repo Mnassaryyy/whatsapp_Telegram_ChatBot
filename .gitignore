@@ -1,3 +1,44 @@
+# Sensitive files - DO NOT COMMIT
+whatsapp-bot/credentials.json
+whatsapp-bot/config.py
+
+# Database files
+whatsapp-bridge/store/*.db
 *.db
-claude_desktop_config.json
-whatsapp.log
+
+# Voice recordings
+whatsapp-bot/voice_*.ogg
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
