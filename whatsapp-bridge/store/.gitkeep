@@ -1,0 +1,6 @@
+# This folder will contain:
+# - whatsapp.db (session/login - automatically created, NOT committed)
+# - messages.db (message history - automatically created, NOT committed)
+#
+# These files are excluded in .gitignore for security
+
