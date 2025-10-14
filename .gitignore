@@ -9,6 +9,12 @@ whatsapp-bridge/store/*.db
 
 # Voice recordings
 whatsapp-bot/voice_*.ogg
+whatsapp-bridge/store/**/*.ogg
+whatsapp-bridge/store/**/*.mp3
+whatsapp-bridge/store/**/*.mp4
+whatsapp-bridge/store/**/*.jpg
+whatsapp-bridge/store/**/*.png
+whatsapp-bridge/store/**/
 
 # Python
 __pycache__/
