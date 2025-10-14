@@ -1,6 +1,7 @@
 # Sensitive files - DO NOT COMMIT
 whatsapp-bot/credentials.json
-whatsapp-bot/config.py
+whatsapp-bot/.env
+*.env
 
 # Database files
 whatsapp-bridge/store/*.db
