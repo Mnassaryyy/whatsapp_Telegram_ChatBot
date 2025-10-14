@@ -16,6 +16,7 @@ class WhatsAppAIBot:
         self.client = OpenAI(api_key=OPENAI_API_KEY)
         self.last_processed_timestamp = datetime.now()
         self.pending_approvals = {}  # Store pending AI replies
+        self.processed_message_ids = set()  # Track processed message IDs to avoid duplicates
         
         # Google Sheets setup
         scopes = ['https://www.googleapis.com/auth/spreadsheets']
@@ -33,21 +34,57 @@ class WhatsAppAIBot:
         conn = sqlite3.connect(DATABASE_PATH)
         cursor = conn.cursor()
         
+        # Convert datetime to string for SQLite comparison
+        timestamp_str = self.last_processed_timestamp.strftime("%Y-%m-%d %H:%M:%S")
+        
         query = """
-            SELECT m.id, m.chat_jid, m.sender, m.content, m.timestamp, c.name
+            SELECT m.id, m.chat_jid, m.sender, m.content, m.timestamp, c.name, m.media_type
             FROM messages m
             LEFT JOIN chats c ON m.chat_jid = c.jid
             WHERE m.timestamp > ? 
             AND m.is_from_me = 0
-            AND m.content != ''
+            AND (m.content != '' OR m.media_type = 'audio')
             ORDER BY m.timestamp ASC
         """
         
-        cursor.execute(query, (self.last_processed_timestamp,))
+        cursor.execute(query, (timestamp_str,))
         messages = cursor.fetchall()
         conn.close()
         
         return messages
+    
+    def transcribe_voice_message(self, message_id, chat_jid):
+        """Download and transcribe voice message"""
+        try:
+            # Download the audio file using WhatsApp API
+            response = requests.post(
+                f"{WHATSAPP_API_URL}/download",
+                json={
+                    "message_id": message_id,
+                    "chat_jid": chat_jid
+                }
+            )
+            
+            result = response.json()
+            if not result.get('success'):
+                return None
+            
+            audio_path = result.get('path')
+            if not audio_path:
+                return None
+            
+            # Transcribe using OpenAI Whisper
+            with open(audio_path, 'rb') as audio_file:
+                transcription = self.client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file
+                )
+            
+            return transcription.text
+            
+        except Exception as e:
+            print(f"Error transcribing voice: {e}", flush=True)
+            return None
     
     # ==================== PHASE 2: AI Reply Generation ====================
     def generate_ai_reply(self, sender_jid, message_text):
@@ -87,6 +124,11 @@ class WhatsAppAIBot:
     # ==================== PHASE 3: Google Sheets Logging ====================
     def log_to_sheets(self, timestamp, sender_id, sender_name, incoming_msg, ai_reply, status="Pending", final_reply=""):
         """Log message and AI reply to Google Sheets"""
+        # Convert timestamp if it's a string
+        if isinstance(timestamp, str):
+            from datetime import datetime
+            timestamp = datetime.fromisoformat(timestamp.replace(' ', 'T'))
+        
         row = [
             timestamp.strftime("%Y-%m-%d %H:%M:%S"),
             sender_id,
@@ -100,14 +142,16 @@ class WhatsAppAIBot:
         return len(self.sheet.get_all_values())  # Return row number
     
     # ==================== PHASE 4: Telegram Notification ====================
-    async def send_telegram_notification(self, sender_name, sender_id, incoming_msg, ai_reply, message_id):
+    async def send_telegram_notification(self, sender_name, sender_id, incoming_msg, ai_reply, message_id, is_voice=False):
         """Send notification to Telegram with approval buttons"""
+        message_type = "🎤 *Voice Message (Transcribed)*" if is_voice else "💬 *Message:*"
+        
         text = f"""🔔 *New WhatsApp Message*
         
 👤 *From:* {sender_name or sender_id}
 📱 *Number:* {sender_id}
 
-💬 *Message:*
+{message_type}
 {incoming_msg}
 
 🤖 *AI Suggested Reply:*
@@ -145,7 +189,7 @@ class WhatsAppAIBot:
         message_id = query.data.replace("approve_", "")
         
         if message_id not in self.pending_approvals:
-            await query.edit_message_text("❌ This request has expired.")
+            await query.edit_message_text("❌ This request has expired or was already processed.")
             return
         
         approval = self.pending_approvals[message_id]
@@ -157,10 +201,10 @@ class WhatsAppAIBot:
             # Update Google Sheets
             self.update_sheet_status(approval['row_number'], "Sent (AI)", approval['ai_reply'])
             await query.edit_message_text(f"✅ *AI Reply Sent Successfully!*\n\nReply: {approval['ai_reply']}", parse_mode='Markdown')
+            # Don't delete - keep for reference
+            # del self.pending_approvals[message_id]
         else:
             await query.edit_message_text("❌ Failed to send message. Check WhatsApp bridge.")
-        
-        del self.pending_approvals[message_id]
     
     async def handle_record_own(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle record own reply button"""
@@ -170,17 +214,20 @@ class WhatsAppAIBot:
         message_id = query.data.replace("record_", "")
         
         if message_id not in self.pending_approvals:
-            await query.edit_message_text("❌ This request has expired.")
+            await query.edit_message_text("❌ This request has expired or was already processed.")
             return
         
         # Store context for voice handler
         context.user_data['pending_voice'] = message_id
         
-        await query.edit_message_text("🎤 *Send your voice message now...*", parse_mode='Markdown')
+        await query.edit_message_text("🎤 *Send your voice message now...*\n\n_Send a voice note in this chat_", parse_mode='Markdown')
     
     async def handle_voice(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle voice message from user"""
+        print(f"Voice message received!", flush=True)
+        
         if 'pending_voice' not in context.user_data:
+            await update.message.reply_text("⚠️ No pending message. Click 'Record Own' first.")
             return
         
         message_id = context.user_data['pending_voice']
@@ -188,25 +235,39 @@ class WhatsAppAIBot:
         
         if not approval:
             await update.message.reply_text("❌ Request expired.")
+            del context.user_data['pending_voice']
             return
         
-        # Download voice message
-        voice = update.message.voice
-        file = await voice.get_file()
-        voice_path = f"voice_{message_id}.ogg"
-        await file.download_to_drive(voice_path)
-        
-        # Send voice to WhatsApp
-        success = self.send_whatsapp_voice(approval['sender_id'], voice_path)
-        
-        if success:
-            self.update_sheet_status(approval['row_number'], "Sent (Manual Voice)", "[Voice Message]")
-            await update.message.reply_text("✅ *Voice message sent successfully!*", parse_mode='Markdown')
-        else:
-            await update.message.reply_text("❌ Failed to send voice message.")
-        
-        del self.pending_approvals[message_id]
-        del context.user_data['pending_voice']
+        try:
+            # Download voice message
+            voice = update.message.voice
+            file = await voice.get_file()
+            voice_path = f"voice_{message_id}.ogg"
+            await file.download_to_drive(voice_path)
+            
+            print(f"Voice downloaded to: {voice_path}", flush=True)
+            
+            # Get absolute path
+            import os
+            abs_voice_path = os.path.abspath(voice_path)
+            
+            # Send voice to WhatsApp
+            success = self.send_whatsapp_voice(approval['sender_id'], abs_voice_path)
+            
+            if success:
+                self.update_sheet_status(approval['row_number'], "Sent (Manual Voice)", "[Voice Message]")
+                await update.message.reply_text("✅ *Voice message sent successfully!*", parse_mode='Markdown')
+                # Don't delete - keep for reference
+                # del self.pending_approvals[message_id]
+            else:
+                await update.message.reply_text("❌ Failed to send voice message. Check WhatsApp bridge.")
+            
+            del context.user_data['pending_voice']
+            
+        except Exception as e:
+            print(f"Error sending voice: {e}", flush=True)
+            await update.message.reply_text(f"❌ Error: {str(e)}")
+            del context.user_data['pending_voice']
     
     # ==================== WhatsApp API Functions ====================
     def send_whatsapp_message(self, recipient, message):
@@ -221,12 +282,13 @@ class WhatsAppAIBot:
             )
             return response.json().get('success', False)
         except Exception as e:
-            print(f"Error sending WhatsApp message: {e}")
+            print(f"Error sending WhatsApp message: {e}", flush=True)
             return False
     
     def send_whatsapp_voice(self, recipient, voice_path):
         """Send voice message to WhatsApp"""
         try:
+            print(f"Sending voice to {recipient} from {voice_path}", flush=True)
             response = requests.post(
                 f"{WHATSAPP_API_URL}/send",
                 json={
@@ -235,9 +297,11 @@ class WhatsAppAIBot:
                     "media_path": voice_path
                 }
             )
-            return response.json().get('success', False)
+            result = response.json()
+            print(f"WhatsApp API response: {result}", flush=True)
+            return result.get('success', False)
         except Exception as e:
-            print(f"Error sending WhatsApp voice: {e}")
+            print(f"Error sending WhatsApp voice: {e}", flush=True)
             return False
     
     # ==================== Helper Functions ====================
@@ -255,11 +319,38 @@ class WhatsAppAIBot:
                 # Check for new messages
                 new_messages = self.get_new_messages()
                 
-                for msg_id, sender_jid, sender, content, timestamp, sender_name in new_messages:
-                    print(f"Processing message from {sender_name or sender}: {content}")
+                for msg_id, sender_jid, sender, content, timestamp, sender_name, media_type in new_messages:
+                    # Skip if already processed
+                    if msg_id in self.processed_message_ids:
+                        continue
                     
-                    # Update last processed timestamp
-                    self.last_processed_timestamp = timestamp
+                    # Mark as processed
+                    self.processed_message_ids.add(msg_id)
+                    
+                    # Keep the set size manageable (keep last 1000 message IDs)
+                    if len(self.processed_message_ids) > 1000:
+                        self.processed_message_ids.pop()
+                    
+                    # Update last processed timestamp (convert from string to datetime)
+                    if isinstance(timestamp, str):
+                        from datetime import datetime
+                        self.last_processed_timestamp = datetime.fromisoformat(timestamp.replace(' ', 'T'))
+                    else:
+                        self.last_processed_timestamp = timestamp
+                    
+                    # Handle voice messages
+                    is_voice = False
+                    if media_type == 'audio' and not content:
+                        is_voice = True
+                        print(f"🎤 Transcribing voice message from {sender_name or sender}...", flush=True)
+                        content = self.transcribe_voice_message(msg_id, sender_jid)
+                        if content:
+                            print(f"Transcription: {content}", flush=True)
+                        else:
+                            print("Failed to transcribe voice message, skipping...", flush=True)
+                            continue
+                    
+                    print(f"Processing message from {sender_name or sender}: {content}", flush=True)
                     
                     # Generate AI reply
                     ai_reply = self.generate_ai_reply(sender_jid, content)
@@ -278,14 +369,16 @@ class WhatsAppAIBot:
                     
                     # Send Telegram notification
                     await self.send_telegram_notification(
-                        sender_name, sender_jid, content, ai_reply, msg_id
+                        sender_name, sender_jid, content, ai_reply, msg_id, is_voice
                     )
                 
                 # Sleep before next check
                 await asyncio.sleep(POLL_INTERVAL)
                 
             except Exception as e:
-                print(f"Error in main loop: {e}")
+                print(f"Error in main loop: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
                 await asyncio.sleep(10)  # Wait before retry
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -308,7 +401,9 @@ class WhatsAppAIBot:
         loop.create_task(self.process_messages())
         
         # Start Telegram bot
-        print("🚀 WhatsApp AI Bot started!")
+        print("🚀 WhatsApp AI Bot started!", flush=True)
+        print("📱 Monitoring for new WhatsApp messages...", flush=True)
+        print("💬 Send /start to your Telegram bot to verify connection", flush=True)
         self.telegram_app.run_polling()
 
 if __name__ == "__main__":
