@@ -24,3 +24,5 @@ DATABASE_PATH = "../whatsapp-bridge/store/messages.db"
 POLL_INTERVAL = 2  # Check for new messages every 2 seconds
 MAX_CONVERSATION_HISTORY = 10  # Number of previous messages to include in AI context
 
+
+

@@ -134,3 +134,5 @@ After everything works:
 3. Add error notifications
 4. Customize AI personality in `generate_ai_reply()`
 
+
+
