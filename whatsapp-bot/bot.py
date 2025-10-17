@@ -73,14 +73,27 @@ class WhatsAppAIBot:
             if not audio_path:
                 return None
             
-            # Transcribe using OpenAI Whisper
+            # Transcribe using OpenAI Whisper with multi-language support
             with open(audio_path, 'rb') as audio_file:
-                transcription = self.client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=audio_file
-                )
+                # Use configured language or auto-detect
+                lang = WHISPER_LANGUAGE if WHISPER_LANGUAGE and WHISPER_LANGUAGE.lower() != "none" else None
+                
+                if lang:
+                    transcription = self.client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=audio_file,
+                        language=lang,
+                        response_format="text"
+                    )
+                else:
+                    # Auto-detect language
+                    transcription = self.client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=audio_file,
+                        response_format="text"
+                    )
             
-            return transcription.text
+            return transcription
             
         except Exception as e:
             print(f"Error transcribing voice: {e}", flush=True)

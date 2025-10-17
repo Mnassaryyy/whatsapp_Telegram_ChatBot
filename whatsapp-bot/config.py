@@ -26,3 +26,8 @@ DATABASE_PATH = os.getenv("DATABASE_PATH", "../whatsapp-bridge/store/messages.db
 # Bot Settings
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "2"))
 MAX_CONVERSATION_HISTORY = int(os.getenv("MAX_CONVERSATION_HISTORY", "10"))
+
+# Whisper Transcription Settings
+# Language codes: "ar" (Arabic), "en" (English), None (auto-detect)
+# For mixed languages, use None for auto-detection
+WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "ar")  # Default to Arabic
