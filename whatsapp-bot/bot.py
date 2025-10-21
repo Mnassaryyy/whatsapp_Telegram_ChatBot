@@ -197,27 +197,66 @@ class WhatsAppAIBot:
     async def handle_approve(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle approve button click"""
         query = update.callback_query
-        await query.answer()
+        try:
+            await query.answer()
+        except Exception as e:
+            print(f"[DEBUG] query.answer() failed: {e}", flush=True)
+            try:
+                import traceback; traceback.print_exc()
+            except Exception:
+                pass
         
         message_id = query.data.replace("approve_", "")
+        print(f"[DEBUG] Approve clicked for message_id={message_id}", flush=True)
         
         if message_id not in self.pending_approvals:
+            print(f"[DEBUG] No pending approval found for message_id={message_id}", flush=True)
             await query.edit_message_text("❌ This request has expired or was already processed.")
             return
         
         approval = self.pending_approvals[message_id]
+        print(
+            f"[DEBUG] Sending AI reply via bridge: recipient={approval.get('sender_id')} "
+            f"reply_len={len(approval.get('ai_reply',''))} api={WHATSAPP_API_URL}",
+            flush=True,
+        )
         
         # Send AI reply to WhatsApp
         success = self.send_whatsapp_message(approval['sender_id'], approval['ai_reply'])
+        print(f"[DEBUG] Bridge send result success={success}", flush=True)
         
         if success:
             # Update Google Sheets
-            self.update_sheet_status(approval['row_number'], "Sent (AI)", approval['ai_reply'])
-            await query.edit_message_text(f"✅ *AI Reply Sent Successfully!*\n\nReply: {approval['ai_reply']}", parse_mode='Markdown')
+            try:
+                self.update_sheet_status(approval['row_number'], "Sent (AI)", approval['ai_reply'])
+            except Exception as e:
+                print(f"[DEBUG] Sheets status update failed: {e}", flush=True)
+                try:
+                    import traceback; traceback.print_exc()
+                except Exception:
+                    pass
+            try:
+                await query.edit_message_text(
+                    f"✅ *AI Reply Sent Successfully!*\n\nReply: {approval['ai_reply']}",
+                    parse_mode='Markdown'
+                )
+            except Exception as e:
+                print(f"[DEBUG] Telegram edit_message_text failed: {e}", flush=True)
+                try:
+                    import traceback; traceback.print_exc()
+                except Exception:
+                    pass
             # Don't delete - keep for reference
             # del self.pending_approvals[message_id]
         else:
-            await query.edit_message_text("❌ Failed to send message. Check WhatsApp bridge.")
+            try:
+                await query.edit_message_text("❌ Failed to send message. Check WhatsApp bridge.")
+            except Exception as e:
+                print(f"[DEBUG] Telegram edit on failure failed: {e}", flush=True)
+                try:
+                    import traceback; traceback.print_exc()
+                except Exception:
+                    pass
     
     async def handle_record_own(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle record own reply button"""
@@ -286,16 +325,33 @@ class WhatsAppAIBot:
     def send_whatsapp_message(self, recipient, message):
         """Send text message to WhatsApp"""
         try:
+            url = f"{WHATSAPP_API_URL}/send"
+            payload = {"recipient": recipient, "message": message}
+            print(f"[DEBUG] POST {url} payload_keys={list(payload.keys())}", flush=True)
             response = requests.post(
-                f"{WHATSAPP_API_URL}/send",
-                json={
-                    "recipient": recipient,
-                    "message": message
-                }
+                url,
+                json=payload,
+                timeout=8,
+                proxies={"http": None, "https": None},
             )
-            return response.json().get('success', False)
+            print(
+                f"[DEBUG] Bridge response status={response.status_code} "
+                f"len={len(response.text) if hasattr(response,'text') else 'NA'}",
+                flush=True,
+            )
+            try:
+                data = response.json()
+            except Exception as je:
+                print(f"[DEBUG] JSON decode failed: {je}; body={response.text}", flush=True)
+                return False
+            print(f"[DEBUG] Bridge response json keys={list(data.keys())}", flush=True)
+            return data.get('success', False)
         except Exception as e:
             print(f"Error sending WhatsApp message: {e}", flush=True)
+            try:
+                import traceback; traceback.print_exc()
+            except Exception:
+                pass
             return False
     
     def send_whatsapp_voice(self, recipient, voice_path):
@@ -308,13 +364,19 @@ class WhatsAppAIBot:
                     "recipient": recipient,
                     "message": "",
                     "media_path": voice_path
-                }
+                },
+                timeout=15,
+                proxies={"http": None, "https": None},
             )
             result = response.json()
             print(f"WhatsApp API response: {result}", flush=True)
             return result.get('success', False)
         except Exception as e:
             print(f"Error sending WhatsApp voice: {e}", flush=True)
+            try:
+                import traceback; traceback.print_exc()
+            except Exception:
+                pass
             return False
     
     # ==================== Helper Functions ====================
