@@ -392,3 +392,4 @@ Your bot is now running 24/7 on DigitalOcean! 🎉
 
 Need help? Check the logs or contact support! 🚀
 
+

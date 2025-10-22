@@ -165,3 +165,4 @@ python bot.py
 - Use `http://127.0.0.1:8080/api` for the bot → bridge URL on VPS.
 - Use fresh Telegram approval cards after restarts.
 
+

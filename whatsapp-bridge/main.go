@@ -21,6 +21,14 @@ import (
 	"github.com/mdp/qrterminal"
 
 	"bytes"
+	"image"
+	"image/color"
+	stdraw "image/draw"
+	"image/png"
+	"strconv"
+	"mime/multipart"
+	"rsc.io/qr"
+	drawx "golang.org/x/image/draw"
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
@@ -857,7 +865,7 @@ func main() {
 	connected := make(chan bool, 1)
 
 	// Connect to WhatsApp
-	if client.Store.ID == nil {
+    if client.Store.ID == nil {
 		// No ID stored, this is a new client, need to pair with phone
 		qrChan, _ := client.GetQRChannel(context.Background())
 		err = client.Connect()
@@ -871,6 +879,54 @@ func main() {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				// Additionally render and save PNG, and try to send to Telegram if env is set
+				func() {
+					defer func() { recover() }()
+					code := evt.Code
+					img, err := qr.Encode(code, qr.L)
+					if err != nil { return }
+					if err := os.MkdirAll("store", 0755); err != nil { return }
+					pngPath := filepath.Join("store", "qr_login.png")
+					f, err := os.Create(pngPath)
+					if err != nil { return }
+					defer f.Close()
+					// Upscale the QR to improve scan reliability in Telegram
+					orig := img.Image()
+					// Target width in pixels (configurable via env QR_PX), default 1024
+					target := 1024
+					if v := os.Getenv("QR_PX"); v != "" {
+						if n, err := strconv.Atoi(v); err == nil && n > 0 { target = n }
+					}
+					scale := target / orig.Bounds().Dx()
+					if scale < 1 { scale = 1 }
+					dst := image.NewRGBA(image.Rect(0, 0, orig.Bounds().Dx()*scale, orig.Bounds().Dy()*scale))
+					drawx.NearestNeighbor.Scale(dst, dst.Bounds(), orig, orig.Bounds(), drawx.Over, nil)
+					// Add a white border for better scanning in-app
+					pad := 40
+					canvas := image.NewRGBA(image.Rect(0, 0, dst.Bounds().Dx()+2*pad, dst.Bounds().Dy()+2*pad))
+					stdraw.Draw(canvas, canvas.Bounds(), &image.Uniform{color.White}, image.Point{}, stdraw.Src)
+					stdraw.Draw(canvas, image.Rect(pad, pad, pad+dst.Bounds().Dx(), pad+dst.Bounds().Dy()), dst, image.Point{}, stdraw.Over)
+					_ = png.Encode(f, canvas)
+
+					botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
+					chatID := os.Getenv("YOUR_TELEGRAM_CHAT_ID")
+					if botToken == "" || chatID == "" { return }
+
+					// Send photo via Telegram sendPhoto
+					buf := &bytes.Buffer{}
+					mw := multipart.NewWriter(buf)
+					_ = mw.WriteField("chat_id", chatID)
+					fw, _ := mw.CreateFormFile("photo", "qr_login.png")
+					fileData, err := os.ReadFile(pngPath)
+					if err == nil { _, _ = fw.Write(fileData) }
+					_ = mw.Close()
+
+					req, _ := http.NewRequest("POST", fmt.Sprintf("https://api.telegram.org/bot%s/sendPhoto", botToken), buf)
+					req.Header.Set("Content-Type", mw.FormDataContentType())
+					clientHTTP := &http.Client{ Timeout: 10 * time.Second }
+					resp, err := clientHTTP.Do(req)
+					if err == nil { _ = resp.Body.Close() }
+				}()
 			} else if evt.Event == "success" {
 				connected <- true
 				break

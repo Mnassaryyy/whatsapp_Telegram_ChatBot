@@ -218,11 +218,12 @@ class WhatsAppAIBot:
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        # Store pending approval
+        # Store pending approval without losing an existing row_number
+        existing = self.pending_approvals.get(message_id, {})
         self.pending_approvals[message_id] = {
             'sender_id': sender_id,
             'ai_reply': ai_reply,
-            'row_number': None  # Will be set after sheets logging
+            'row_number': existing.get('row_number')
         }
 
         return await self.telegram_app.bot.send_message(

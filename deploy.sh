@@ -136,3 +136,4 @@ echo "  Check status:    systemctl status whatsapp-bot"
 echo ""
 echo "🎉 Your bot is now running 24/7!"
 
+
