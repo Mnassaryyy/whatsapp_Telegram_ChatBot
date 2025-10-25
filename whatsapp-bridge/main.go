@@ -21,14 +21,10 @@ import (
 	"github.com/mdp/qrterminal"
 
 	"bytes"
-	"image"
-	"image/color"
-	stdraw "image/draw"
-	"image/png"
 	"strconv"
 	"mime/multipart"
-	"rsc.io/qr"
-	drawx "golang.org/x/image/draw"
+
+	qrcode "github.com/skip2/go-qrcode"
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
@@ -782,6 +778,84 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler to logout (clear session and disconnect)
+	http.HandleFunc("/api/logout", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		// Disconnect client if connected
+		if client.IsConnected() {
+			client.Disconnect()
+		}
+		// Prefer deleting the device session from the store instead of removing the DB file
+		// This avoids Windows file locks while still forcing QR on next login
+		var err error
+        if client.Store != nil {
+            err = client.Store.Delete(context.Background())
+        }
+		resp := map[string]any{"success": err == nil, "message": "Session cleared; use /api/login to re-pair"}
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			resp["message"] = err.Error()
+		}
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	// Handler to (re)login and emit QR code to Telegram
+	http.HandleFunc("/api/login", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		go func() {
+			// If already connected, do nothing
+			if client.IsConnected() {
+				fmt.Println("Already connected; login skipped")
+				return
+			}
+			// If no device ID, do pairing QR flow
+			qrChan, _ := client.GetQRChannel(context.Background())
+			if err := client.Connect(); err != nil {
+				fmt.Printf("Login connect failed: %v\n", err)
+				return
+			}
+			for evt := range qrChan {
+				if evt.Event == "code" {
+					fmt.Println("\nScan this QR code with your WhatsApp app:")
+					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+					// Also render and send PNG to Telegram (upscaled with border for better scan)
+					func() {
+						defer func() { recover() }()
+                    _ = os.MkdirAll("store", 0755)
+                    pngPath := filepath.Join("store", "qr_login.png")
+                    target := 1024
+                    if v := os.Getenv("QR_PX"); v != "" { if n, e := strconv.Atoi(v); e == nil && n > 0 { target = n } }
+                    // Generate PNG directly at desired size using go-qrcode
+                    if err := qrcode.WriteFile(evt.Code, qrcode.Medium, target, pngPath); err != nil { return }
+						botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
+						chatID := os.Getenv("YOUR_TELEGRAM_CHAT_ID")
+						if botToken == "" || chatID == "" { return }
+						buf := &bytes.Buffer{}
+						mw := multipart.NewWriter(buf)
+						_ = mw.WriteField("chat_id", chatID)
+						fw, _ := mw.CreateFormFile("photo", "qr_login.png")
+						data, err := os.ReadFile(pngPath); if err == nil { _, _ = fw.Write(data) }
+						_ = mw.Close()
+						req, _ := http.NewRequest("POST", fmt.Sprintf("https://api.telegram.org/bot%s/sendPhoto", botToken), buf)
+						req.Header.Set("Content-Type", mw.FormDataContentType())
+						_, _ = http.DefaultClient.Do(req)
+					}()
+				} else if evt.Event == "success" {
+					break
+				}
+			}
+		}()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "Login process started; check Telegram for QR"})
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -882,31 +956,13 @@ func main() {
 				// Additionally render and save PNG, and try to send to Telegram if env is set
 				func() {
 					defer func() { recover() }()
-					code := evt.Code
-					img, err := qr.Encode(code, qr.L)
-					if err != nil { return }
-					if err := os.MkdirAll("store", 0755); err != nil { return }
+                code := evt.Code
+                if err := os.MkdirAll("store", 0755); err != nil { return }
 					pngPath := filepath.Join("store", "qr_login.png")
-					f, err := os.Create(pngPath)
-					if err != nil { return }
-					defer f.Close()
-					// Upscale the QR to improve scan reliability in Telegram
-					orig := img.Image()
-					// Target width in pixels (configurable via env QR_PX), default 1024
-					target := 1024
-					if v := os.Getenv("QR_PX"); v != "" {
-						if n, err := strconv.Atoi(v); err == nil && n > 0 { target = n }
-					}
-					scale := target / orig.Bounds().Dx()
-					if scale < 1 { scale = 1 }
-					dst := image.NewRGBA(image.Rect(0, 0, orig.Bounds().Dx()*scale, orig.Bounds().Dy()*scale))
-					drawx.NearestNeighbor.Scale(dst, dst.Bounds(), orig, orig.Bounds(), drawx.Over, nil)
-					// Add a white border for better scanning in-app
-					pad := 40
-					canvas := image.NewRGBA(image.Rect(0, 0, dst.Bounds().Dx()+2*pad, dst.Bounds().Dy()+2*pad))
-					stdraw.Draw(canvas, canvas.Bounds(), &image.Uniform{color.White}, image.Point{}, stdraw.Src)
-					stdraw.Draw(canvas, image.Rect(pad, pad, pad+dst.Bounds().Dx(), pad+dst.Bounds().Dy()), dst, image.Point{}, stdraw.Over)
-					_ = png.Encode(f, canvas)
+                // Render PNG directly at desired size using go-qrcode
+                target := 1024
+                if v := os.Getenv("QR_PX"); v != "" { if n, err := strconv.Atoi(v); err == nil && n > 0 { target = n } }
+                if err := qrcode.WriteFile(code, qrcode.Medium, target, pngPath); err != nil { return }
 
 					botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
 					chatID := os.Getenv("YOUR_TELEGRAM_CHAT_ID")

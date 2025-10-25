@@ -13,6 +13,7 @@ import json
 from datetime import datetime
 from openai import OpenAI
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -53,22 +54,32 @@ class WhatsAppAIBot:
                 ['Timestamp', 'Sender ID', 'Sender Name', 'Incoming Message', 'AI Reply', 'Status', 'Final Reply Sent'])
 
         # Build Telegram Application
+        # Telegram app with shorter timeouts to reduce callback timeouts
+        req = HTTPXRequest(connect_timeout=5.0, read_timeout=5.0, write_timeout=5.0, pool_timeout=5.0)
         self.telegram_app = (
             Application
             .builder()
             .token(TELEGRAM_BOT_TOKEN)
+            .request(req)
             .build()
         )
 
         # Register handlers - Order matters!
         self.telegram_app.add_handler(CommandHandler("start", self.start_command))
+        self.telegram_app.add_handler(CommandHandler("logout", self.cmd_logout))
+        self.telegram_app.add_handler(CommandHandler("login", self.cmd_login))
         self.telegram_app.add_handler(CommandHandler("queue", self.cmd_queue))
         self.telegram_app.add_handler(CommandHandler("next", self.cmd_next))
         self.telegram_app.add_handler(CallbackQueryHandler(self.handle_approve, pattern=r"^approve_"))
         self.telegram_app.add_handler(CallbackQueryHandler(self.handle_record_own, pattern=r"^record_"))
         self.telegram_app.add_handler(CallbackQueryHandler(self.handle_reject, pattern=r"^reject_"))
         self.telegram_app.add_handler(CallbackQueryHandler(self.handle_reply_later, pattern=r"^later_"))
+        self.telegram_app.add_handler(CallbackQueryHandler(self.handle_custom_init, pattern=r"^custom_"))
         self.telegram_app.add_handler(MessageHandler(filters.VOICE, self.handle_voice))
+        self.telegram_app.add_handler(MessageHandler(filters.PHOTO, self.handle_custom_photo))
+        self.telegram_app.add_handler(MessageHandler(filters.Document.ALL, self.handle_custom_document))
+        self.telegram_app.add_handler(MessageHandler(filters.VIDEO, self.handle_custom_video))
+        self.telegram_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), self.handle_custom_text))
 
         # Ensure queue table exists (persisted alongside messages DB)
         try:
@@ -443,6 +454,7 @@ class WhatsAppAIBot:
             InlineKeyboardButton("❌ Reject", callback_data=f"reject_{msg_id}"),
         ],[
             InlineKeyboardButton("🎤 Record Own", callback_data=f"record_{msg_id}"),
+            InlineKeyboardButton("✍️ Custom Message", callback_data=f"custom_{msg_id}"),
             InlineKeyboardButton("🕓 Reply Later", callback_data=f"later_{msg_id}")
         ]]
         try:
@@ -539,20 +551,20 @@ class WhatsAppAIBot:
     async def handle_approve(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle approval button click"""
         query = update.callback_query
-        await query.answer()  # Acknowledge the button click
-        
-        # Extract message_id from callback data
+        try:
+            await query.answer()
+        except Exception as e:
+            print(f"query.answer failed: {e}", flush=True)
+
         message_id = query.data.replace("approve_", "")
-        print(f"\n{'=' * 60}", flush=True)
-        print(f"[APPROVE BUTTON CLICKED]", flush=True)
-        print(f"Message ID: {message_id}", flush=True)
-        print(f"{'=' * 60}\n", flush=True)
+        print(
+            f"\n{'=' * 60}\n[APPROVE BUTTON CLICKED]\nMessage ID: {message_id}\n{'=' * 60}\n",
+            flush=True,
+        )
 
-        # Get pending approval data
+        # Resolve approval context
         approval = self.pending_approvals.get(message_id)
-
         if not approval:
-            # Try to recover from persistent queue (e.g., after a restart)
             try:
                 conn = sqlite3.connect(DATABASE_PATH)
                 cur = conn.cursor()
@@ -560,86 +572,77 @@ class WhatsAppAIBot:
                     "SELECT chat_jid, ai_reply, row_number FROM queue_items WHERE message_id=? ORDER BY last_transition_at DESC, id DESC LIMIT 1",
                     (message_id,),
                 )
-                r = cur.fetchone(); conn.close()
+                r = cur.fetchone()
+                conn.close()
                 if r:
-                    approval = { 'sender_id': r[0], 'ai_reply': r[1], 'row_number': r[2] }
+                    approval = {"sender_id": r[0], "ai_reply": r[1], "row_number": r[2]}
                     self.pending_approvals[message_id] = approval
             except Exception as e:
                 print(f"Recovery lookup failed: {e}", flush=True)
 
         if not approval:
             print(f"❌ No approval found for message_id: {message_id}", flush=True)
-            print(f"Available approvals: {list(self.pending_approvals.keys())}", flush=True)
-            await query.edit_message_text("⚠️ This request has expired or was already processed.")
-            # Free any stuck active queue item for this message and advance
+            await self.safe_edit(query, "⚠️ This request has expired or was already processed.")
             try:
                 conn = sqlite3.connect(DATABASE_PATH)
                 cur = conn.cursor()
-                cur.execute("UPDATE queue_items SET status='pending', last_transition_at=CURRENT_TIMESTAMP WHERE status='active' AND message_id=?", (message_id,))
-                conn.commit(); conn.close()
+                cur.execute(
+                    "UPDATE queue_items SET status='pending', last_transition_at=CURRENT_TIMESTAMP WHERE status='active' AND message_id=?",
+                    (message_id,),
+                )
+                conn.commit()
+                conn.close()
             except Exception as e:
                 print(f"Queue reset on expired failed: {e}", flush=True)
             nxt = self.activate_next_pending()
             if nxt:
                 await self.present_active_item(nxt)
             return
-        
+
+        # Try to send (wrap entire send and branches in one try)
         try:
-            # Send the AI reply to WhatsApp
             print(f"📤 Sending to WhatsApp...", flush=True)
             print(f"   Recipient: {approval['sender_id']}", flush=True)
             print(f"   Message: {approval['ai_reply']}", flush=True)
 
-        success = self.send_whatsapp_message(approval['sender_id'], approval['ai_reply'])
-        
-        if success:
-                print(f"✅ WhatsApp message sent successfully!", flush=True)
-
-                # Update Google Sheets status
-                if approval.get('row_number'):
+            success = self.send_whatsapp_message(approval["sender_id"], approval["ai_reply"])
+            if success:
+                if approval.get("row_number"):
                     self.update_sheet_status(
-                        approval['row_number'],
-                        "Sent (AI Reply)",
-                        approval['ai_reply']
+                        approval["row_number"], "Sent (AI Reply)", approval["ai_reply"]
                     )
-                    print(f"📊 Google Sheets updated (Row {approval['row_number']})", flush=True)
-
-                # Update Telegram message (text or media caption)
                 await self.safe_edit(
                     query,
-                    f"✅ *Message Approved & Sent!*\n\n"
-                    f"Sent to: {approval['sender_id']}\n"
-                    f"Reply: {approval['ai_reply']}",
-                    parse_mode='Markdown'
+                    f"✅ *Message Approved & Sent!*\n\nSent to: {approval['sender_id']}\nReply: {approval['ai_reply']}",
+                    parse_mode="Markdown",
                 )
-                # mark queue done and present next
                 try:
                     conn = sqlite3.connect(DATABASE_PATH)
-                    cur = conn.cursor(); cur.execute("SELECT id FROM queue_items WHERE message_id=? AND status='active' ORDER BY id DESC LIMIT 1", (message_id,))
-                    r = cur.fetchone(); conn.close()
+                    cur = conn.cursor()
+                    cur.execute(
+                        "SELECT id FROM queue_items WHERE message_id=? AND status='active' ORDER BY id DESC LIMIT 1",
+                        (message_id,),
+                    )
+                    r = cur.fetchone()
+                    conn.close()
                     if r:
-                        self.mark_item_status(r[0], 'done')
+                        self.mark_item_status(r[0], "done")
                 except Exception:
                     pass
                 nxt = self.activate_next_pending()
                 if nxt:
                     await self.present_active_item(nxt)
-        else:
-                print(f"❌ Failed to send WhatsApp message", flush=True)
-                await query.edit_message_text(
-                    "❌ *Failed to send message to WhatsApp.*\n\n"
-                    "Please check:\n"
-                    "- WhatsApp bridge is running\n"
-                    "- API endpoint is correct\n"
-                    "- Network connection",
-                    parse_mode='Markdown'
+            else:
+                await self.safe_edit(
+                    query,
+                    "❌ Failed to send message to WhatsApp. Check bridge/API.",
+                    parse_mode="Markdown",
                 )
-
         except Exception as e:
             print(f"❌ Error in handle_approve: {e}", flush=True)
             import traceback
             traceback.print_exc()
-            await query.edit_message_text(f"❌ Error: {str(e)}")
+            await self.safe_edit(query, f"❌ Error: {str(e)}")
     
     async def handle_record_own(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle 'Record Own' button click"""
@@ -753,6 +756,123 @@ class WhatsAppAIBot:
         if nxt:
             await self.present_active_item(nxt)
 
+    async def handle_custom_init(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        message_id = query.data.replace("custom_", "")
+        context.user_data['custom_target'] = message_id
+        await self.safe_edit(query, "✍️ Send your custom message now (text/photo/video/document/voice).")
+
+    async def handle_custom_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if 'custom_target' not in context.user_data:
+            return
+        message_id = context.user_data['custom_target']
+        approval = self.pending_approvals.get(message_id)
+        if not approval:
+            # recover from queue
+            conn = sqlite3.connect(DATABASE_PATH); cur = conn.cursor()
+            cur.execute("SELECT chat_jid FROM queue_items WHERE message_id=? ORDER BY id DESC LIMIT 1", (message_id,))
+            r = cur.fetchone(); conn.close()
+            if not r: return
+            approval = {'sender_id': r[0], 'ai_reply': '', 'row_number': None}
+        sent = self.send_whatsapp_message(approval['sender_id'], update.message.text)
+        if sent:
+            await update.message.reply_text("✅ Custom text sent.")
+            # mark done and advance
+            try:
+                conn = sqlite3.connect(DATABASE_PATH); cur = conn.cursor()
+                cur.execute("SELECT id FROM queue_items WHERE message_id=? AND status='active' ORDER BY id DESC LIMIT 1", (message_id,))
+                r = cur.fetchone(); conn.close()
+                if r: self.mark_item_status(r[0], 'done')
+            except Exception: pass
+            context.user_data.pop('custom_target', None)
+            nxt = self.activate_next_pending()
+            if nxt: await self.present_active_item(nxt)
+        else:
+            await update.message.reply_text("❌ Failed to send.")
+
+    async def handle_custom_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if 'custom_target' not in context.user_data: return
+        message_id = context.user_data['custom_target']
+        approval = self.pending_approvals.get(message_id)
+        if not approval:
+            conn = sqlite3.connect(DATABASE_PATH); cur = conn.cursor()
+            cur.execute("SELECT chat_jid FROM queue_items WHERE message_id=? ORDER BY id DESC LIMIT 1", (message_id,))
+            r = cur.fetchone(); conn.close()
+            if not r: return
+            approval = {'sender_id': r[0]}
+        file = await update.message.photo[-1].get_file()
+        local = f"custom_{message_id}.jpg"; await file.download_to_drive(local)
+        try:
+            resp = requests.post(f"{WHATSAPP_API_URL}/send", json={"recipient": approval['sender_id'], "message":"", "media_path": os.path.abspath(local)}, timeout=15)
+            ok = resp.json().get('success', False)
+        except Exception: ok=False
+        await update.message.reply_text("✅ Custom image sent." if ok else "❌ Failed to send image. Tap Custom again to retry.")
+        # Mark done and advance regardless to avoid blocking queue
+        try:
+            conn = sqlite3.connect(DATABASE_PATH); cur = conn.cursor()
+            cur.execute("SELECT id FROM queue_items WHERE message_id=? AND status='active' ORDER BY id DESC LIMIT 1", (message_id,))
+            r = cur.fetchone(); conn.close()
+            if r: self.mark_item_status(r[0], 'done')
+        except Exception: pass
+        context.user_data.pop('custom_target', None)
+        nxt = self.activate_next_pending()
+        if nxt: await self.present_active_item(nxt)
+
+    async def handle_custom_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if 'custom_target' not in context.user_data: return
+        message_id = context.user_data['custom_target']
+        approval = self.pending_approvals.get(message_id)
+        if not approval:
+            conn = sqlite3.connect(DATABASE_PATH); cur = conn.cursor()
+            cur.execute("SELECT chat_jid FROM queue_items WHERE message_id=? ORDER BY id DESC LIMIT 1", (message_id,))
+            r = cur.fetchone(); conn.close()
+            if not r: return
+            approval = {'sender_id': r[0]}
+        file = await update.message.document.get_file()
+        local = f"custom_{message_id}_{update.message.document.file_name or 'doc'}"
+        await file.download_to_drive(local)
+        try:
+            resp = requests.post(f"{WHATSAPP_API_URL}/send", json={"recipient": approval['sender_id'], "message":"", "media_path": os.path.abspath(local)}, timeout=30)
+            ok = resp.json().get('success', False)
+        except Exception: ok=False
+        await update.message.reply_text("✅ Custom document sent." if ok else "❌ Failed to send document. Tap Custom again to retry.")
+        try:
+            conn = sqlite3.connect(DATABASE_PATH); cur = conn.cursor()
+            cur.execute("SELECT id FROM queue_items WHERE message_id=? AND status='active' ORDER BY id DESC LIMIT 1", (message_id,))
+            r = cur.fetchone(); conn.close()
+            if r: self.mark_item_status(r[0], 'done')
+        except Exception: pass
+        context.user_data.pop('custom_target', None)
+        nxt = self.activate_next_pending()
+        if nxt: await self.present_active_item(nxt)
+
+    async def handle_custom_video(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if 'custom_target' not in context.user_data: return
+        message_id = context.user_data['custom_target']
+        approval = self.pending_approvals.get(message_id)
+        if not approval:
+            conn = sqlite3.connect(DATABASE_PATH); cur = conn.cursor()
+            cur.execute("SELECT chat_jid FROM queue_items WHERE message_id=? ORDER BY id DESC LIMIT 1", (message_id,))
+            r = cur.fetchone(); conn.close()
+            if not r: return
+            approval = {'sender_id': r[0]}
+        file = await update.message.video.get_file()
+        local = f"custom_{message_id}.mp4"; await file.download_to_drive(local)
+        try:
+            resp = requests.post(f"{WHATSAPP_API_URL}/send", json={"recipient": approval['sender_id'], "message":"", "media_path": os.path.abspath(local)}, timeout=60)
+            ok = resp.json().get('success', False)
+        except Exception: ok=False
+        await update.message.reply_text("✅ Custom video sent." if ok else "❌ Failed to send video. Tap Custom again to retry.")
+        try:
+            conn = sqlite3.connect(DATABASE_PATH); cur = conn.cursor()
+            cur.execute("SELECT id FROM queue_items WHERE message_id=? AND status='active' ORDER BY id DESC LIMIT 1", (message_id,))
+            r = cur.fetchone(); conn.close()
+            if r: self.mark_item_status(r[0], 'done')
+        except Exception: pass
+        context.user_data.pop('custom_target', None)
+        nxt = self.activate_next_pending()
+        if nxt: await self.present_active_item(nxt)
     async def handle_reject(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Reject the current message and move on without sending."""
         query = update.callback_query
@@ -933,6 +1053,30 @@ class WhatsAppAIBot:
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
         await update.message.reply_text("🤖 WhatsApp AI Bot is running!\n\nI'm monitoring your WhatsApp messages...")
+    
+    async def cmd_logout(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            resp = requests.post(f"{WHATSAPP_API_URL}/logout", timeout=10, proxies={"http": None, "https": None})
+            ok = False; msg = ""
+            try:
+                data = resp.json(); ok = data.get("success", False); msg = data.get("message", "")
+            except Exception:
+                msg = resp.text
+            await update.message.reply_text("✅ Logged out. QR will be required next login." if ok else f"❌ Logout failed: {msg}")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Logout error: {e}")
+
+    async def cmd_login(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            resp = requests.post(f"{WHATSAPP_API_URL}/login", timeout=10, proxies={"http": None, "https": None})
+            ok = False; msg = ""
+            try:
+                data = resp.json(); ok = data.get("success", False); msg = data.get("message", "")
+            except Exception:
+                msg = resp.text
+            await update.message.reply_text("✅ Login started. Check Telegram for QR." if ok else f"❌ Login failed: {msg}")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Login error: {e}")
     
     async def cmd_queue(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show queue summary."""
