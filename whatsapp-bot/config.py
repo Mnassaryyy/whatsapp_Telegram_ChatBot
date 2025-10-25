@@ -26,6 +26,10 @@ DATABASE_PATH = os.getenv("DATABASE_PATH", "../whatsapp-bridge/store/messages.db
 # Bot Settings
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "2"))
 MAX_CONVERSATION_HISTORY = int(os.getenv("MAX_CONVERSATION_HISTORY", "10"))
+AI_SYSTEM_PROMPT = os.getenv(
+    "AI_SYSTEM_PROMPT",
+    "You are a helpful WhatsApp assistant. Respond naturally and conversationally.",
+)
 
 # Whisper Transcription Settings
 # Language codes: "ar" (Arabic), "en" (English), None (auto-detect)
