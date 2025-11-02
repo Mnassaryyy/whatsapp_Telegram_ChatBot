@@ -1,0 +1,5 @@
+[33m194bf49[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m Add Arabic voice support and DigitalOcean deployment guide
+[33m3692d07[m Update .gitignore to exclude downloaded media files
+[33m1ccd142[m Add voice message support, fix infinite loop, fix approval expiration, improve logging
+[33m09b69d4[m Update to use gpt-4o-mini model (cheaper)
+[33mdbec9cb[m Switch to .env for configuration (more secure)

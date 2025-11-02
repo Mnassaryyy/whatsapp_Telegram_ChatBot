@@ -26,6 +26,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 import asyncio
 from config import *
+from helpers import ai_utils, media_utils, queue_utils, batch_utils, telegram_utils, whatsapp_api
 import logging
 
 logging.basicConfig(
@@ -41,6 +42,13 @@ class WhatsAppAIBot:
         self.pending_approvals = {}  # Store pending AI replies
         self.processed_message_ids = set()  # Track processed message IDs to avoid duplicates
         self.first_card_sent = False  # Controls timestamp wording on first presented item
+        # Batch window (seconds) for concatenating short/fragmented texts before AI
+        try:
+            self.batch_window_sec = int(os.getenv("BATCH_WINDOW_SECONDS", "1200"))
+        except Exception:
+            self.batch_window_sec = 1200
+        # Per-chat buffer: chat_jid -> {texts: [str], last_msg_id: str, sender_name: str, last_timestamp: datetime}
+        self.incoming_buffers = {}
         
         # Google Sheets setup
         scopes = ['https://www.googleapis.com/auth/spreadsheets']
@@ -109,6 +117,13 @@ class WhatsAppAIBot:
         except Exception as e:
             print(f"Failed to ensure queue table: {e}", flush=True)
     
+    # ==================== Batch Buffer Helpers ====================
+    def _buffer_add_text(self, chat_jid: str, msg_id: str, sender_name: str, text: str, timestamp):
+        batch_utils.buffer_add_text(self, chat_jid, msg_id, sender_name, text, timestamp)
+
+    def _flush_ready_buffers(self) -> bool:
+        return batch_utils.flush_ready_buffers(self)
+    
     # ==================== PHASE 1: Message Detection ====================
     def get_new_messages(self):
         """Monitor database for new messages"""
@@ -135,248 +150,50 @@ class WhatsAppAIBot:
         return messages
     
     def transcribe_voice_message(self, message_id, chat_jid):
-        """Download and transcribe voice message"""
-        try:
-            # Download the audio file using WhatsApp API
-            response = requests.post(
-                f"{WHATSAPP_API_URL}/download",
-                json={
-                    "message_id": message_id,
-                    "chat_jid": chat_jid
-                }
-            )
-            
-            result = response.json()
-            if not result.get('success'):
-                return None
-            
-            audio_path = result.get('path')
-            if not audio_path:
-                return None
-            
-            # Transcribe using OpenAI Whisper with multi-language support
-            with open(audio_path, 'rb') as audio_file:
-                # Use configured language or auto-detect
-                lang = WHISPER_LANGUAGE if WHISPER_LANGUAGE and WHISPER_LANGUAGE.lower() != "none" else None
-                
-                if lang:
-                    transcription = self.client.audio.transcriptions.create(
-                        model="whisper-1",
-                        file=audio_file,
-                        language=lang,
-                        response_format="text"
-                    )
-                else:
-                    # Auto-detect language
-                    transcription = self.client.audio.transcriptions.create(
-                        model="whisper-1",
-                        file=audio_file,
-                        response_format="text"
-                    )
-            
-            return transcription
-            
-        except Exception as e:
-            print(f"Error transcribing voice: {e}", flush=True)
-            return None
+        return ai_utils.transcribe_voice_message(self, message_id, chat_jid)
     
     # ==================== PHASE 2: AI Reply Generation ====================
     def generate_ai_reply(self, sender_jid, message_text):
-        """Generate AI reply using GPT with conversation context"""
-        # Get conversation history
-        conn = sqlite3.connect(DATABASE_PATH)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT content, is_from_me, timestamp 
-            FROM messages 
-            WHERE chat_jid = ? 
-            ORDER BY timestamp DESC 
-            LIMIT ?
-        """, (sender_jid, MAX_CONVERSATION_HISTORY))
-        
-        history = cursor.fetchall()
-        conn.close()
-        
-        # Build conversation context
-        context_messages = [
-            {"role": "system", "content": AI_SYSTEM_PROMPT}
-        ]
-        
-        for msg_content, is_from_me, _ in reversed(history):
-            role = "assistant" if is_from_me else "user"
-            context_messages.append({"role": role, "content": msg_content})
-        
-        # Generate reply
-        response = self.client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=context_messages
-        )
-        
-        return response.choices[0].message.content
+        return ai_utils.generate_ai_reply(self, sender_jid, message_text)
     
     # ==================== Media Download & Telegram Send ====================
     def download_media(self, message_id, chat_jid):
-        """Ask bridge to download media and return (ok, media_type, filename, abs_path)."""
-        try:
-            url = f"{WHATSAPP_API_URL}/download"
-            resp = requests.post(
-                url,
-                json={"message_id": message_id, "chat_jid": chat_jid},
-                timeout=12,
-                proxies={"http": None, "https": None},
-            )
-            data = resp.json()
-            if not data.get("success"):
-                return False, "", "", ""
-            # Bridge returns: Success, Message, Filename, Path
-            return True, data.get("Message", ""), data.get("Filename", ""), data.get("Path", "")
-        except Exception as e:
-            print(f"Error downloading media: {e}", flush=True)
-            return False, "", "", ""
+        return media_utils.download_media(self, message_id, chat_jid)
 
     async def send_telegram_media(self, media_type, media_path, caption):
-        """Send media preview to Telegram chat with best matching method."""
-        try:
-            if not os.path.isabs(media_path):
-                media_path = os.path.abspath(media_path)
-            if not os.path.exists(media_path):
-                print(f"Media path not found: {media_path}", flush=True)
-                return
-
-            if media_type == "image":
-                with open(media_path, "rb") as f:
-                    await self.telegram_app.bot.send_photo(chat_id=YOUR_TELEGRAM_CHAT_ID, photo=f, caption=caption)
-            elif media_type == "video":
-                with open(media_path, "rb") as f:
-                    await self.telegram_app.bot.send_video(chat_id=YOUR_TELEGRAM_CHAT_ID, video=f, caption=caption)
-            else:
-                # document or other
-                with open(media_path, "rb") as f:
-                    await self.telegram_app.bot.send_document(chat_id=YOUR_TELEGRAM_CHAT_ID, document=f, caption=caption)
-        except Exception as e:
-            print(f"Error sending media preview to Telegram: {e}", flush=True)
+        await media_utils.send_telegram_media(self, media_type, media_path, caption)
 
     def find_recent_media_in_store(self, chat_jid: str) -> str:
-        """Heuristic fallback: pick the most recent file under bridge store/<chat_jid>."""
-        try:
-            base = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "whatsapp-bridge", "store", chat_jid))
-            if not os.path.isdir(base):
-                return ""
-            latest_path = ""; latest_mtime = 0
-            for root, _, files in os.walk(base):
-                for name in files:
-                    p = os.path.join(root, name)
-                    try:
-                        m = os.path.getmtime(p)
-                        if m > latest_mtime:
-                            latest_mtime = m; latest_path = p
-                    except Exception:
-                        pass
-            return latest_path
-        except Exception:
-            return ""
+        return media_utils.find_recent_media_in_store(chat_jid)
 
     def get_media_size_bytes(self, message_id: str, chat_jid: str) -> int:
-        try:
-            conn = sqlite3.connect(DATABASE_PATH)
-            cur = conn.cursor()
-            cur.execute("SELECT file_length FROM messages WHERE id=? AND chat_jid=?", (message_id, chat_jid))
-            r = cur.fetchone(); conn.close()
-            if r and r[0]:
-                return int(r[0])
-        except Exception:
-            pass
-        return 0
+        return media_utils.get_media_size_bytes(DATABASE_PATH, message_id, chat_jid)
 
     def format_size(self, num_bytes: int) -> str:
-        units = ["B", "KB", "MB", "GB"]
-        size = float(num_bytes)
-        i = 0
-        while size >= 1024 and i < len(units)-1:
-            size /= 1024.0
-            i += 1
-        return f"{size:.1f} {units[i]}" if num_bytes > 0 else "unknown"
+        return media_utils.format_size(num_bytes)
 
     # ==================== Queue Helpers ====================
     def is_greeting(self, text: str) -> bool:
-        if not text:
-            return False
-        t = text.strip().lower()
-        keywords = ("hi", "hello", "hey", "assalam", "good morning", "good evening", "good night", "salam")
-        return any(k in t for k in keywords) and len(t) <= 30
+        return queue_utils.is_greeting(text)
 
     def enqueue_item(self, message_id, chat_jid, sender_name, content, media_type, media_path, ai_reply, row_number):
         priority = 50 if self.is_greeting(content or "") else 20
-        try:
-            conn = sqlite3.connect(DATABASE_PATH)
-            cur = conn.cursor()
-            cur.execute(
-                """
-                INSERT INTO queue_items (message_id, chat_jid, sender_name, content, media_type, media_path, ai_reply, row_number, status, priority, last_transition_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, CURRENT_TIMESTAMP)
-                """,
-                (message_id, chat_jid, sender_name or chat_jid, content or "", media_type or "", media_path or "", ai_reply or "", row_number or 0, priority),
-            )
-            conn.commit(); conn.close()
-        except Exception as e:
-            print(f"Failed to enqueue item: {e}", flush=True)
+        queue_utils.enqueue_item(DATABASE_PATH, message_id, chat_jid, sender_name, content, media_type, media_path, ai_reply, row_number, priority)
 
     def get_active_item(self):
-        try:
-            conn = sqlite3.connect(DATABASE_PATH)
-            cur = conn.cursor()
-            cur.execute("SELECT id, message_id, chat_jid, sender_name, content, media_type, media_path, ai_reply, row_number FROM queue_items WHERE status='active' ORDER BY id LIMIT 1")
-            row = cur.fetchone(); conn.close()
-            return row
-        except Exception as e:
-            print(f"Failed to load active item: {e}", flush=True)
-            return None
+        return queue_utils.get_active_item(DATABASE_PATH)
 
     def activate_next_pending(self):
-        try:
-            conn = sqlite3.connect(DATABASE_PATH)
-            cur = conn.cursor()
-            cur.execute("SELECT id FROM queue_items WHERE status='pending' ORDER BY priority ASC, created_at ASC LIMIT 1")
-            row = cur.fetchone()
-            if not row:
-                conn.close(); return None
-            qid = row[0]
-            cur.execute("UPDATE queue_items SET status='active', last_transition_at=CURRENT_TIMESTAMP WHERE id=?", (qid,))
-            conn.commit()
-            cur.execute("SELECT id, message_id, chat_jid, sender_name, content, media_type, media_path, ai_reply, row_number FROM queue_items WHERE id=?", (qid,))
-            item = cur.fetchone(); conn.close(); return item
-        except Exception as e:
-            print(f"Failed to activate next pending: {e}", flush=True)
-            return None
+        return queue_utils.activate_next_pending(DATABASE_PATH)
 
     def mark_item_status(self, qid: int, status: str):
-        try:
-            conn = sqlite3.connect(DATABASE_PATH)
-            cur = conn.cursor()
-            cur.execute("UPDATE queue_items SET status=?, last_transition_at=CURRENT_TIMESTAMP WHERE id=?", (status, qid))
-            conn.commit(); conn.close()
-        except Exception as e:
-            print(f"Failed to set status {status} on {qid}: {e}", flush=True)
+        queue_utils.mark_item_status(DATABASE_PATH, qid, status)
 
     def pending_count(self) -> int:
-        try:
-            conn = sqlite3.connect(DATABASE_PATH)
-            cur = conn.cursor(); cur.execute("SELECT COUNT(1) FROM queue_items WHERE status='pending'")
-            n = cur.fetchone()[0]; conn.close(); return int(n)
-        except Exception:
-            return 0
+        return queue_utils.pending_count(DATABASE_PATH)
 
     async def safe_edit(self, query, text, parse_mode=None):
-        """Edit a message card that might be text or media with caption."""
-        try:
-            msg = query.message
-            if msg and (getattr(msg, 'photo', None) or getattr(msg, 'video', None) or getattr(msg, 'document', None)):
-                await query.edit_message_caption(caption=text, parse_mode=parse_mode)
-            else:
-                await query.edit_message_text(text, parse_mode=parse_mode)
-        except Exception as e:
-            print(f"safe_edit failed: {e}", flush=True)
+        await telegram_utils.safe_edit(query, text, parse_mode)
 
     async def present_active_item(self, item):
         if not item:
@@ -449,14 +266,7 @@ class WhatsAppAIBot:
 🤖 *AI Suggested Reply:*
 {ai_reply}
 """
-        keyboard = [[
-            InlineKeyboardButton("✅ Approve & Send", callback_data=f"approve_{msg_id}"),
-            InlineKeyboardButton("❌ Reject", callback_data=f"reject_{msg_id}"),
-        ],[
-            InlineKeyboardButton("🎤 Record Own", callback_data=f"record_{msg_id}"),
-            InlineKeyboardButton("✍️ Custom Message", callback_data=f"custom_{msg_id}"),
-            InlineKeyboardButton("🕓 Reply Later", callback_data=f"later_{msg_id}")
-        ]]
+        keyboard = telegram_utils.build_full_approval_keyboard(msg_id)
         try:
             print(f"Sending media card: type={media_type} path={media_path}", flush=True)
             if media_type in ("image", "video", "document") and media_path:
@@ -479,7 +289,7 @@ class WhatsAppAIBot:
                 self.first_card_sent = True
                 return
             else:
-                await self.telegram_app.bot.send_message(chat_id=YOUR_TELEGRAM_CHAT_ID, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+                await self.telegram_app.bot.send_message(chat_id=YOUR_TELEGRAM_CHAT_ID, text=text, reply_markup=keyboard, parse_mode='Markdown')
         except Exception as e:
             print(f"Failed to send approval card: {e}", flush=True)
         # After first present, switch to relative wording for subsequent items
@@ -524,13 +334,7 @@ class WhatsAppAIBot:
 {ai_reply}
 """
         
-        keyboard = [
-            [
-                InlineKeyboardButton("✅ Approve & Send", callback_data=f"approve_{message_id}"),
-                InlineKeyboardButton("🎤 Record Own", callback_data=f"record_{message_id}")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        reply_markup = telegram_utils.build_notification_keyboard(message_id)
         
         # Store pending approval without losing an existing row_number
         existing = self.pending_approvals.get(message_id, {})
@@ -555,7 +359,7 @@ class WhatsAppAIBot:
             await query.answer()
         except Exception as e:
             print(f"query.answer failed: {e}", flush=True)
-
+        
         message_id = query.data.replace("approve_", "")
         print(
             f"\n{'=' * 60}\n[APPROVE BUTTON CLICKED]\nMessage ID: {message_id}\n{'=' * 60}\n",
@@ -598,7 +402,7 @@ class WhatsAppAIBot:
             if nxt:
                 await self.present_active_item(nxt)
             return
-
+        
         # Try to send (wrap entire send and branches in one try)
         try:
             print(f"📤 Sending to WhatsApp...", flush=True)
@@ -608,9 +412,7 @@ class WhatsAppAIBot:
             success = self.send_whatsapp_message(approval["sender_id"], approval["ai_reply"])
             if success:
                 if approval.get("row_number"):
-                    self.update_sheet_status(
-                        approval["row_number"], "Sent (AI Reply)", approval["ai_reply"]
-                    )
+                    self.update_sheet_status(approval["row_number"], "Sent (AI Reply)", approval["ai_reply"])
                 await self.safe_edit(
                     query,
                     f"✅ *Message Approved & Sent!*\n\nSent to: {approval['sender_id']}\nReply: {approval['ai_reply']}",
@@ -896,54 +698,12 @@ class WhatsAppAIBot:
     # ==================== WhatsApp API Functions ====================
     def send_whatsapp_message(self, recipient, message):
         """Send text message to WhatsApp"""
-        try:
-            print(f"\n[SEND_WHATSAPP_MESSAGE]", flush=True)
-            print(f"  URL: {WHATSAPP_API_URL}/send", flush=True)
-            print(f"  Recipient: {recipient}", flush=True)
-            print(f"  Message: {message}", flush=True)
-
-            resp = requests.post(
-                f"{WHATSAPP_API_URL}/send",
-                json={
-                    "recipient": recipient,
-                    "message": message
-                },
-                timeout=10
-            )
-
-            print(f"  Status Code: {resp.status_code}", flush=True)
-            print(f"  Response: {resp.text}", flush=True)
-
-            j = resp.json()
-            success = j.get("success", False)
-            print(f"  Success: {success}", flush=True)
-            return success
-
-        except Exception as e:
-            print(f"❌ Error sending WhatsApp message: {e}", flush=True)
-            import traceback
-            traceback.print_exc()
-            return False
+        ok = whatsapp_api.send_text(recipient, message)
+        return ok
     
     def send_whatsapp_voice(self, recipient, voice_path):
         """Send voice message to WhatsApp"""
-        try:
-            print(f"Sending voice to {recipient} from {voice_path}", flush=True)
-            response = requests.post(
-                f"{WHATSAPP_API_URL}/send",
-                json={
-                    "recipient": recipient,
-                    "message": "",
-                    "media_path": voice_path
-                },
-                timeout=10
-            )
-            result = response.json()
-            print(f"WhatsApp API response: {result}", flush=True)
-            return result.get('success', False)
-        except Exception as e:
-            print(f"Error sending WhatsApp voice: {e}", flush=True)
-            return False
+        return whatsapp_api.send_voice(recipient, voice_path)
     
     # ==================== Helper Functions ====================
     def update_sheet_status(self, row_number, status, final_reply):
@@ -995,6 +755,10 @@ class WhatsAppAIBot:
                         else:
                             print("Failed to transcribe voice message, skipping...", flush=True)
                             continue
+                        # For voice (transcribed text), add to buffer and defer AI generation
+                        self._buffer_add_text(sender_jid, msg_id, sender_name, content, timestamp)
+                        # Do not enqueue now; will be flushed when idle
+                        continue
                     elif media_type in ("image", "video", "document"):
                         ok, _, filename, path = self.download_media(msg_id, sender_jid)
                         if ok and path:
@@ -1022,20 +786,26 @@ class WhatsAppAIBot:
                             media_path_for_enqueue = ""
 
                     print(f"\n📨 Processing message from {sender_name or sender}: {content}", flush=True)
-                    
-                    # Generate AI reply
-                    ai_reply = self.generate_ai_reply(sender_jid, content)
+
+                    # If this is a plain text (or non-media) message, add to buffer and defer AI
+                    if media_type not in ("image", "video", "document"):
+                        self._buffer_add_text(sender_jid, msg_id, sender_name, content or "", timestamp)
+                        # Do not enqueue immediately; batching will flush later
+                        continue
+
+                    # Media messages proceed as before (AI for caption context if needed)
+                    ai_reply = self.generate_ai_reply(sender_jid, content or "")
                     print(f"🤖 AI Reply: {ai_reply}", flush=True)
-                    
-                    # Log to Google Sheets
-                    row_number = self.log_to_sheets(timestamp, sender_jid, sender_name, content, ai_reply)
-                    # Prepare media path for non-audio (reuse if already downloaded above)
+                    row_number = self.log_to_sheets(timestamp, sender_jid, sender_name, content or "", ai_reply)
                     media_path = locals().get('media_path_for_enqueue', "") if media_type in ("image", "video", "document") else ""
-                    # Enqueue
-                    self.enqueue_item(msg_id, sender_jid, sender_name, content, media_type, media_path, ai_reply, row_number)
+                    self.enqueue_item(msg_id, sender_jid, sender_name, content or "", media_type, media_path, ai_reply, row_number)
                     enqueued_any = True
 
-                # After enqueueing the batch, if nothing was active, present the next pending now
+                # Flush any buffered chats that are idle beyond the batch window
+                flushed = self._flush_ready_buffers()
+                enqueued_any = enqueued_any or flushed
+
+                # After enqueueing, if nothing was active, present the next pending now
                 if (not active_before) and enqueued_any:
                     nxt = self.activate_next_pending()
                     if nxt:
