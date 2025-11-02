@@ -61,10 +61,8 @@ class WhatsAppAIBot:
         self.processed_message_ids = set()  # Track processed message IDs to avoid duplicates
         self.first_card_sent = False  # Controls timestamp wording on first presented item
         # Batch window (seconds) for concatenating short/fragmented texts before AI
-        try:
-            self.batch_window_sec = int(os.getenv("BATCH_WINDOW_SECONDS", "1200"))
-        except Exception:
-            self.batch_window_sec = 1200
+        # Hard-coded to 20 minutes per request.
+        self.batch_window_sec = 1200
         # Per-chat buffer: chat_jid -> {texts: [str], last_msg_id: str, sender_name: str, last_timestamp: datetime}
         self.incoming_buffers = {}
         
@@ -168,46 +166,59 @@ class WhatsAppAIBot:
         return messages
     
     def transcribe_voice_message(self, message_id, chat_jid):
+        """Download and transcribe a WhatsApp voice message via the bridge."""
         return ai_utils.transcribe_voice_message(self, message_id, chat_jid)
     
     # ==================== PHASE 2: AI Reply Generation ====================
     def generate_ai_reply(self, sender_jid, message_text):
+        """Generate a suggested reply using recent conversation context."""
         return ai_utils.generate_ai_reply(self, sender_jid, message_text)
     
     # ==================== Media Download & Telegram Send ====================
     def download_media(self, message_id, chat_jid):
+        """Ask the bridge to download media for a given message and return paths."""
         return media_utils.download_media(self, message_id, chat_jid)
 
     async def send_telegram_media(self, media_type, media_path, caption):
+        """Send media to Telegram with appropriate method (photo/video/document)."""
         await media_utils.send_telegram_media(self, media_type, media_path, caption)
 
     def find_recent_media_in_store(self, chat_jid: str) -> str:
+        """Heuristic fallback to resolve a recent file under store/<chat>."""
         return media_utils.find_recent_media_in_store(chat_jid)
 
     def get_media_size_bytes(self, message_id: str, chat_jid: str) -> int:
+        """Read media size from DB if available; 0 if unknown."""
         return media_utils.get_media_size_bytes(DATABASE_PATH, message_id, chat_jid)
 
     def format_size(self, num_bytes: int) -> str:
+        """Human-readable file size string."""
         return media_utils.format_size(num_bytes)
 
     # ==================== Queue Helpers ====================
     def is_greeting(self, text: str) -> bool:
+        """Return True if text looks like a short greeting (higher priority)."""
         return queue_utils.is_greeting(text)
 
     def enqueue_item(self, message_id, chat_jid, sender_name, content, media_type, media_path, ai_reply, row_number):
+        """Insert item into the approval queue with greeting-aware priority."""
         priority = 50 if self.is_greeting(content or "") else 20
         queue_utils.enqueue_item(DATABASE_PATH, message_id, chat_jid, sender_name, content, media_type, media_path, ai_reply, row_number, priority)
 
     def get_active_item(self):
+        """Return the currently active queue item, if any."""
         return queue_utils.get_active_item(DATABASE_PATH)
 
     def activate_next_pending(self):
+        """Promote the next pending item to active state and return it."""
         return queue_utils.activate_next_pending(DATABASE_PATH)
 
     def mark_item_status(self, qid: int, status: str):
+        """Update a queue item's status and timestamp."""
         queue_utils.mark_item_status(DATABASE_PATH, qid, status)
 
     def pending_count(self) -> int:
+        """Return count of items currently pending approval."""
         return queue_utils.pending_count(DATABASE_PATH)
 
     async def safe_edit(self, query, text, parse_mode=None):
@@ -557,6 +568,7 @@ class WhatsAppAIBot:
             del context.user_data['pending_voice']
     
     async def handle_reply_later(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Defer the active item by moving it back to pending, then show next."""
         query = update.callback_query
         await query.answer()
         message_id = query.data.replace("later_", "")
@@ -586,6 +598,7 @@ class WhatsAppAIBot:
             await self.present_active_item(nxt)
 
     async def handle_custom_init(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Begin custom reply flow; subsequent user message becomes the reply."""
         query = update.callback_query
         await query.answer()
         message_id = query.data.replace("custom_", "")
@@ -593,6 +606,7 @@ class WhatsAppAIBot:
         await self.safe_edit(query, "✍️ Send your custom message now (text/photo/video/document/voice).")
 
     async def handle_custom_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle a free-form text reply for the selected WhatsApp chat."""
         if 'custom_target' not in context.user_data:
             return
         message_id = context.user_data['custom_target']
@@ -621,6 +635,7 @@ class WhatsAppAIBot:
             await update.message.reply_text("❌ Failed to send.")
 
     async def handle_custom_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle an image upload and forward it to WhatsApp for the target chat."""
         if 'custom_target' not in context.user_data: return
         message_id = context.user_data['custom_target']
         approval = self.pending_approvals.get(message_id)
@@ -649,6 +664,7 @@ class WhatsAppAIBot:
         if nxt: await self.present_active_item(nxt)
 
     async def handle_custom_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle a document upload and forward it to WhatsApp for the target chat."""
         if 'custom_target' not in context.user_data: return
         message_id = context.user_data['custom_target']
         approval = self.pending_approvals.get(message_id)
@@ -677,6 +693,7 @@ class WhatsAppAIBot:
         if nxt: await self.present_active_item(nxt)
 
     async def handle_custom_video(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle a video upload and forward it to WhatsApp for the target chat."""
         if 'custom_target' not in context.user_data: return
         message_id = context.user_data['custom_target']
         approval = self.pending_approvals.get(message_id)
@@ -852,6 +869,7 @@ class WhatsAppAIBot:
         await update.message.reply_text("🤖 WhatsApp AI Bot is running!\n\nI'm monitoring your WhatsApp messages...")
     
     async def cmd_logout(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Log out WhatsApp on the bridge; requires scanning QR on next login."""
         try:
             resp = requests.post(f"{WHATSAPP_API_URL}/logout", timeout=10, proxies={"http": None, "https": None})
             ok = False; msg = ""
@@ -864,6 +882,7 @@ class WhatsAppAIBot:
             await update.message.reply_text(f"❌ Logout error: {e}")
 
     async def cmd_login(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Trigger bridge login; QR will be generated and sent to Telegram."""
         try:
             resp = requests.post(f"{WHATSAPP_API_URL}/login", timeout=10, proxies={"http": None, "https": None})
             ok = False; msg = ""
