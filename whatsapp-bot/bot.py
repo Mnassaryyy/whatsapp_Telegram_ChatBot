@@ -1,3 +1,16 @@
+"""Telegram-WhatsApp bridge bot.
+
+This module houses the Telegram bot application and orchestrates the WhatsApp bridge
+workflow: polling WhatsApp DB, batching fragmented texts, generating AI replies,
+logging to Google Sheets, and presenting approval cards to Telegram for human-in-the-loop.
+
+Key responsibilities:
+- Monitor the WhatsApp SQLite DB (via the Go bridge) for new inbound messages
+- Batch short/fragmented texts per chat for a configurable idle window (default 20 min)
+- Generate suggested replies using OpenAI with recent conversation context
+- Forward media previews to Telegram and present approval actions
+- Send approved replies/media back to WhatsApp via the bridge REST API
+"""
 # bot.py
 from pathlib import Path
 from dotenv import load_dotenv
@@ -36,6 +49,11 @@ logging.basicConfig(
 
 
 class WhatsAppAIBot:
+    """Main application class for the Telegram-facing approval bot.
+
+    Creates the Telegram app, manages batching state, and coordinates the
+    end-to-end flow from WhatsApp -> Telegram -> WhatsApp.
+    """
     def __init__(self):
         self.client = OpenAI(api_key=OPENAI_API_KEY)
         self.last_processed_timestamp = datetime.now()
@@ -193,9 +211,14 @@ class WhatsAppAIBot:
         return queue_utils.pending_count(DATABASE_PATH)
 
     async def safe_edit(self, query, text, parse_mode=None):
+        """Safely edit a Telegram message or caption depending on payload type."""
         await telegram_utils.safe_edit(query, text, parse_mode)
 
     async def present_active_item(self, item):
+        """Render the active queue item as a Telegram card (text or media).
+
+        Includes age, sender, and AI suggestion, with inline actions.
+        """
         if not item:
             return
         qid, msg_id, chat_jid, sender_name, content, media_type, media_path, ai_reply, row_number = item
@@ -298,7 +321,7 @@ class WhatsAppAIBot:
     # ==================== PHASE 3: Google Sheets Logging ====================
     def log_to_sheets(self, timestamp, sender_id, sender_name, incoming_msg, ai_reply, status="Pending",
                       final_reply=""):
-        """Log message and AI reply to Google Sheets"""
+        """Append a single row to the Google Sheet for auditing and status tracking."""
         # Convert timestamp if it's a string
         if isinstance(timestamp, str):
             from datetime import datetime
@@ -319,7 +342,7 @@ class WhatsAppAIBot:
     # ==================== PHASE 4: Telegram Notification ====================
     async def send_telegram_notification(self, sender_name, sender_id, incoming_msg, ai_reply, message_id,
                                          is_voice=False):
-        """Send notification to Telegram with approval buttons"""
+        """Send a simplified notification card to Telegram (used in some flows)."""
         message_type = "🎤 *Voice Message (Transcribed)*" if is_voice else "💬 *Message:*"
         
         text = f"""🔔 *New WhatsApp Message*
@@ -353,7 +376,11 @@ class WhatsAppAIBot:
     
     # ==================== PHASE 5: Approval System ====================
     async def handle_approve(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle approval button click"""
+        """Handle Approve & Send action.
+
+        Looks up the pending approval context, sends via the bridge, updates
+        Google Sheets, marks queue item done, then advances to the next.
+        """
         query = update.callback_query
         try:
             await query.answer()
@@ -473,7 +500,7 @@ class WhatsAppAIBot:
         print(f"✅ Ready to receive voice message", flush=True)
     
     async def handle_voice(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle voice message from user"""
+        """Handle a Telegram voice note recorded as a manual reply and relay to WhatsApp."""
         print(f"\n[VOICE MESSAGE RECEIVED]", flush=True)
         
         if 'pending_voice' not in context.user_data:
