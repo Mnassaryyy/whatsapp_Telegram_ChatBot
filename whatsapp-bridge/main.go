@@ -35,6 +35,14 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// getStoreDir returns the base directory for persistent data (defaults to "store").
+func getStoreDir() string {
+    if v := os.Getenv("STORE_DIR"); v != "" {
+        return v
+    }
+    return "store"
+}
+
 // Message represents a chat message for our client
 type Message struct {
 	Time      time.Time
@@ -52,13 +60,13 @@ type MessageStore struct {
 
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
-	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+    // Create directory for database if it doesn't exist
+    if err := os.MkdirAll(getStoreDir(), 0755); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+    db, err := sql.Open("sqlite3", fmt.Sprintf("file:%s/messages.db?_foreign_keys=on", getStoreDir()))
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -565,8 +573,8 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var fileLength uint64
 	var err error
 
-	// First, check if we already have this file
-	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
+    // First, check if we already have this file
+    chatDir := fmt.Sprintf("%s/%s", getStoreDir(), strings.ReplaceAll(chatJID, ":", "_"))
 	localPath := ""
 
 	// Get media info from the database
@@ -828,8 +836,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 					// Also render and send PNG to Telegram (upscaled with border for better scan)
 					func() {
 						defer func() { recover() }()
-                    _ = os.MkdirAll("store", 0755)
-                    pngPath := filepath.Join("store", "qr_login.png")
+                    _ = os.MkdirAll(getStoreDir(), 0755)
+                    pngPath := filepath.Join(getStoreDir(), "qr_login.png")
                     target := 1024
                     if v := os.Getenv("QR_PX"); v != "" { if n, e := strconv.Atoi(v); e == nil && n > 0 { target = n } }
                     // Generate PNG directly at desired size using go-qrcode
@@ -876,13 +884,13 @@ func main() {
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
-	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+    // Create directory for database if it doesn't exist
+    if err := os.MkdirAll(getStoreDir(), 0755); err != nil {
 		logger.Errorf("Failed to create store directory: %v", err)
 		return
 	}
 
-	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+    container, err := sqlstore.New(context.Background(), "sqlite3", fmt.Sprintf("file:%s/whatsapp.db?_foreign_keys=on", getStoreDir()), dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
@@ -957,8 +965,8 @@ func main() {
 				func() {
 					defer func() { recover() }()
                 code := evt.Code
-                if err := os.MkdirAll("store", 0755); err != nil { return }
-					pngPath := filepath.Join("store", "qr_login.png")
+                if err := os.MkdirAll(getStoreDir(), 0755); err != nil { return }
+                    pngPath := filepath.Join(getStoreDir(), "qr_login.png")
                 // Render PNG directly at desired size using go-qrcode
                 target := 1024
                 if v := os.Getenv("QR_PX"); v != "" { if n, err := strconv.Atoi(v); err == nil && n > 0 { target = n } }
@@ -1017,8 +1025,14 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+    // Start REST API server (configurable via BRIDGE_PORT)
+    port := 8080
+    if v := os.Getenv("BRIDGE_PORT"); v != "" {
+        if p, err := strconv.Atoi(v); err == nil && p > 0 && p < 65536 {
+            port = p
+        }
+    }
+    startRESTServer(client, messageStore, port)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)

@@ -254,3 +254,198 @@ go run main.go
 **That's everything!** Your client can just follow these commands in order. 🎯
 
 
+
+
+---
+
+## ⚙️ Multi-Instance Setup (Run 2+ bots on one VPS)
+
+This enables multiple independent WhatsApp + Bot instances on the same server.
+
+### Overview
+- Each instance uses its own bridge port and data directory.
+- Each bot uses its own folder and .env (and a unique Telegram bot token).
+
+### 1) Create two bot folders with separate .env
+```bash
+cd /root/whatsapp_Telegram_ChatBot
+cp -r whatsapp-bot whatsapp-bot-1
+cp -r whatsapp-bot whatsapp-bot-2
+
+# Instance 1 .env
+cat > whatsapp-bot-1/.env << 'EOF'
+OPENAI_API_KEY=YOUR_OPENAI_KEY
+OPENAI_MODEL=gpt-4o-mini
+TELEGRAM_BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN_1
+YOUR_TELEGRAM_CHAT_ID=YOUR_CHAT_ID
+GOOGLE_SHEET_ID=SHEET_ID_1
+SHEET_NAME=WhatsApp Messages (Inst1)
+GOOGLE_SHEETS_CREDENTIALS_FILE=credentials.json
+WHATSAPP_API_URL=http://127.0.0.1:8081/api
+DATABASE_PATH=../whatsapp-bridge/store/messages.db  # unused for multi-store, but required
+POLL_INTERVAL=2
+MAX_CONVERSATION_HISTORY=10
+WHISPER_LANGUAGE=ar
+NO_PROXY=127.0.0.1,localhost
+no_proxy=127.0.0.1,localhost
+EOF
+
+# Instance 2 .env
+cat > whatsapp-bot-2/.env << 'EOF'
+OPENAI_API_KEY=YOUR_OPENAI_KEY
+OPENAI_MODEL=gpt-4o-mini
+TELEGRAM_BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN_2
+YOUR_TELEGRAM_CHAT_ID=YOUR_CHAT_ID
+GOOGLE_SHEET_ID=SHEET_ID_2
+SHEET_NAME=WhatsApp Messages (Inst2)
+GOOGLE_SHEETS_CREDENTIALS_FILE=credentials.json
+WHATSAPP_API_URL=http://127.0.0.1:8082/api
+DATABASE_PATH=../whatsapp-bridge/store/messages.db
+POLL_INTERVAL=2
+MAX_CONVERSATION_HISTORY=10
+WHISPER_LANGUAGE=ar
+NO_PROXY=127.0.0.1,localhost
+no_proxy=127.0.0.1,localhost
+EOF
+
+# Copy Google credentials to both folders (same file is fine)
+cp whatsapp-bot/credentials.json whatsapp-bot-1/
+cp whatsapp-bot/credentials.json whatsapp-bot-2/
+```
+
+Install Python deps once (shared system site):
+```bash
+pip3 install -r whatsapp-bot/requirements.txt
+```
+
+### 2) Pair WhatsApp for each instance (first time)
+Use two bridge instances with different ports and store dirs.
+
+Option A — simple with screen (shows QR in terminal):
+```bash
+# Instance 1 bridge (port 8081, store at /root/wa_store_1)
+screen -S whatsapp-bridge-1 -dm bash -lc "cd /root/whatsapp_Telegram_ChatBot/whatsapp-bridge && BRIDGE_PORT=8081 STORE_DIR=/root/wa_store_1 go run main.go"
+screen -r whatsapp-bridge-1   # attach, scan QR, then Ctrl+A then D
+
+# Instance 2 bridge (port 8082, store at /root/wa_store_2)
+screen -S whatsapp-bridge-2 -dm bash -lc "cd /root/whatsapp_Telegram_ChatBot/whatsapp-bridge && BRIDGE_PORT=8082 STORE_DIR=/root/wa_store_2 go run main.go"
+screen -r whatsapp-bridge-2   # attach, scan QR, then Ctrl+A then D
+```
+
+Tip: Bridges can also push the QR PNG to Telegram automatically if you set `TELEGRAM_BOT_TOKEN` and `YOUR_TELEGRAM_CHAT_ID` as environment variables for the bridge processes.
+
+### 3) Start both bots (screen)
+```bash
+screen -S whatsapp-bot-1 -dm bash -lc "cd /root/whatsapp_Telegram_ChatBot/whatsapp-bot-1 && python3 bot.py"
+screen -S whatsapp-bot-2 -dm bash -lc "cd /root/whatsapp_Telegram_ChatBot/whatsapp-bot-2 && python3 bot.py"
+
+# Verify
+screen -ls | grep whatsapp-
+ss -ltnp | egrep ':8081|:8082'
+```
+
+### 4) Recommended: systemd services per instance
+
+Create bridge units:
+```bash
+cat > /etc/systemd/system/whatsapp-bridge-1.service << 'EOF'
+[Unit]
+Description=WhatsApp Bridge (Instance 1)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/whatsapp_Telegram_ChatBot/whatsapp-bridge
+Environment=BRIDGE_PORT=8081
+Environment=STORE_DIR=/root/wa_store_1
+Environment=TELEGRAM_BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN_1
+Environment=YOUR_TELEGRAM_CHAT_ID=YOUR_CHAT_ID
+ExecStart=/usr/local/go/bin/go run main.go
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > /etc/systemd/system/whatsapp-bridge-2.service << 'EOF'
+[Unit]
+Description=WhatsApp Bridge (Instance 2)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/whatsapp_Telegram_ChatBot/whatsapp-bridge
+Environment=BRIDGE_PORT=8082
+Environment=STORE_DIR=/root/wa_store_2
+Environment=TELEGRAM_BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN_2
+Environment=YOUR_TELEGRAM_CHAT_ID=YOUR_CHAT_ID
+ExecStart=/usr/local/go/bin/go run main.go
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+Create bot units:
+```bash
+cat > /etc/systemd/system/whatsapp-bot-1.service << 'EOF'
+[Unit]
+Description=WhatsApp AI Bot (Instance 1)
+After=network.target whatsapp-bridge-1.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/whatsapp_Telegram_ChatBot/whatsapp-bot-1
+Environment=NO_PROXY=127.0.0.1,localhost
+Environment=no_proxy=127.0.0.1,localhost
+ExecStart=/usr/bin/python3 bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > /etc/systemd/system/whatsapp-bot-2.service << 'EOF'
+[Unit]
+Description=WhatsApp AI Bot (Instance 2)
+After=network.target whatsapp-bridge-2.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/whatsapp_Telegram_ChatBot/whatsapp-bot-2
+Environment=NO_PROXY=127.0.0.1,localhost
+Environment=no_proxy=127.0.0.1,localhost
+ExecStart=/usr/bin/python3 bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable whatsapp-bridge-1 whatsapp-bridge-2 whatsapp-bot-1 whatsapp-bot-2
+systemctl start whatsapp-bridge-1 whatsapp-bridge-2
+sleep 2
+systemctl start whatsapp-bot-1 whatsapp-bot-2
+```
+
+Check status and health:
+```bash
+systemctl status whatsapp-bridge-1 whatsapp-bridge-2 whatsapp-bot-1 whatsapp-bot-2
+journalctl -u whatsapp-bridge-1 -f
+ss -ltnp | egrep ':8081|:8082'
+```
+
+Notes:
+- Each instance must use a unique Telegram bot token. The same Telegram chat ID is fine.
+- Each bridge will maintain its own WhatsApp session under its STORE_DIR. You may pair to the same phone if WhatsApp allows multiple linked devices, or use separate numbers.
+- Point each bot’s `WHATSAPP_API_URL` to its bridge port (8081, 8082, ...).
