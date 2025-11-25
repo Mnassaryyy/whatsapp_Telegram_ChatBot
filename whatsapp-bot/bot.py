@@ -61,8 +61,13 @@ class WhatsAppAIBot:
         self.processed_message_ids = set()  # Track processed message IDs to avoid duplicates
         self.first_card_sent = False  # Controls timestamp wording on first presented item
         # Batch window (seconds) for concatenating short/fragmented texts before AI
-        # Hard-coded to 20 minutes per request.
-        self.batch_window_sec = 1200
+        # Default 20 minutes, can be overridden with BATCH_WINDOW_SEC env var
+        batch_window = os.getenv("BATCH_WINDOW_SEC", "1200")
+        try:
+            self.batch_window_sec = int(batch_window)
+        except ValueError:
+            self.batch_window_sec = 1200  # Default to 20 minutes if invalid
+        print(f"⏱️  Batch window: {self.batch_window_sec} seconds ({self.batch_window_sec // 60} minutes)", flush=True)
         # Per-chat buffer: chat_jid -> {texts: [str], last_msg_id: str, sender_name: str, last_timestamp: datetime}
         self.incoming_buffers = {}
         
@@ -143,27 +148,38 @@ class WhatsAppAIBot:
     # ==================== PHASE 1: Message Detection ====================
     def get_new_messages(self):
         """Monitor database for new messages"""
-        conn = sqlite3.connect(DATABASE_PATH)
-        cursor = conn.cursor()
-        
-        # Convert datetime to string for SQLite comparison
-        timestamp_str = self.last_processed_timestamp.strftime("%Y-%m-%d %H:%M:%S")
-        
-        query = """
-            SELECT m.id, m.chat_jid, m.sender, m.content, m.timestamp, c.name, m.media_type
-            FROM messages m
-            LEFT JOIN chats c ON m.chat_jid = c.jid
-            WHERE m.timestamp > ? 
-            AND m.is_from_me = 0
-                  AND (m.content != '' OR m.media_type != '')
-                ORDER BY m.timestamp ASC \
-        """
-        
-        cursor.execute(query, (timestamp_str,))
-        messages = cursor.fetchall()
-        conn.close()
-        
-        return messages
+        try:
+            # Convert to absolute path
+            db_path = os.path.abspath(DATABASE_PATH) if not os.path.isabs(DATABASE_PATH) else DATABASE_PATH
+            if not os.path.exists(db_path):
+                print(f"⚠️  Database not found at: {db_path}", flush=True)
+                return []
+            
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            
+            # Convert datetime to string for SQLite comparison
+            timestamp_str = self.last_processed_timestamp.strftime("%Y-%m-%d %H:%M:%S")
+            
+            query = """
+                SELECT m.id, m.chat_jid, m.sender, m.content, m.timestamp, c.name, m.media_type
+                FROM messages m
+                LEFT JOIN chats c ON m.chat_jid = c.jid
+                WHERE m.timestamp > ? 
+                AND m.is_from_me = 0
+                      AND (m.content != '' OR m.media_type != '')
+                    ORDER BY m.timestamp ASC
+            """
+            
+            cursor.execute(query, (timestamp_str,))
+            messages = cursor.fetchall()
+            conn.close()
+            
+            return messages
+        except Exception as e:
+            print(f"❌ Error reading database: {e}", flush=True)
+            print(f"   Database path: {DATABASE_PATH}", flush=True)
+            return []
     
     def transcribe_voice_message(self, message_id, chat_jid):
         """Download and transcribe a WhatsApp voice message via the bridge."""
@@ -760,11 +776,16 @@ class WhatsAppAIBot:
     async def process_messages(self):
         """Main message processing loop"""
         print("\n🔄 Starting WhatsApp message monitoring...\n", flush=True)
+        print(f"📂 Database path: {os.path.abspath(DATABASE_PATH)}", flush=True)
+        print(f"📂 Database exists: {os.path.exists(os.path.abspath(DATABASE_PATH))}\n", flush=True)
 
         while True:
             try:
                 # Check for new messages
                 new_messages = self.get_new_messages()
+                
+                if new_messages:
+                    print(f"📨 Found {len(new_messages)} new message(s)", flush=True)
                 # Enqueue all first, then present one active to ensure pending count reflects full batch
                 enqueued_any = False
                 active_before = self.get_active_item()
@@ -772,10 +793,12 @@ class WhatsAppAIBot:
                 for msg_id, sender_jid, sender, content, timestamp, sender_name, media_type in new_messages:
                     # Skip if already processed
                     if msg_id in self.processed_message_ids:
+                        print(f"⏭️  Skipping already processed message: {msg_id}", flush=True)
                         continue
                     
                     # Mark as processed
                     self.processed_message_ids.add(msg_id)
+                    print(f"✅ Marked message {msg_id} as processed", flush=True)
                     
                     # Keep the set size manageable (keep last 1000 message IDs)
                     if len(self.processed_message_ids) > 1000:
@@ -834,6 +857,9 @@ class WhatsAppAIBot:
                     # If this is a plain text (or non-media) message, add to buffer and defer AI
                     if media_type not in ("image", "video", "document"):
                         self._buffer_add_text(sender_jid, msg_id, sender_name, content or "", timestamp)
+                        buf = self.incoming_buffers.get(sender_jid)
+                        if buf:
+                            print(f"📝 Added to buffer (will wait {self.batch_window_sec // 60} min). Buffer now has {len(buf.get('texts', []))} message(s)", flush=True)
                         # Do not enqueue immediately; batching will flush later
                         continue
 
@@ -846,7 +872,11 @@ class WhatsAppAIBot:
                     enqueued_any = True
 
                 # Flush any buffered chats that are idle beyond the batch window
+                if self.incoming_buffers:
+                    print(f"⏳ Checking buffers... ({len(self.incoming_buffers)} chat(s) buffered)", flush=True)
                 flushed = self._flush_ready_buffers()
+                if flushed:
+                    print(f"✅ Flushed buffered messages and sent to Telegram!", flush=True)
                 enqueued_any = enqueued_any or flushed
 
                 # After enqueueing, if nothing was active, present the next pending now

@@ -52,21 +52,37 @@ def flush_ready_buffers(bot, joiner: str = " \n") -> bool:
             if getattr(last_ts, 'tzinfo', None) is not None:
                 last_ts = last_ts.replace(tzinfo=None)
             idle = (now - last_ts).total_seconds()
+            idle_min = int(idle // 60)
+            idle_sec = int(idle % 60)
             if idle >= bot.batch_window_sec:
                 combined = joiner.join(buf["texts"]).strip()
                 last_msg_id = buf.get("last_msg_id")
                 sender_name = buf.get("sender_name")
+                print(f"🔄 Flushing buffer for {sender_name} (idle {idle_min}m {idle_sec}s, {len(buf['texts'])} message(s))...", flush=True)
                 try:
                     ai_reply = generate_ai_reply(bot, chat_jid, combined)
+                    print(f"🤖 AI Reply generated for {sender_name}", flush=True)
                     ts = last_ts
                     row_number = bot.log_to_sheets(ts, chat_jid, sender_name, combined, ai_reply)
                     bot.enqueue_item(last_msg_id, chat_jid, sender_name, combined, "", "", ai_reply, row_number)
+                    print(f"✅ Enqueued message from {sender_name} for Telegram", flush=True)
                     enqueued_any = True
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"❌ Error flushing buffer: {e}", flush=True)
+                    import traceback
+                    traceback.print_exc()
                 bot.incoming_buffers.pop(chat_jid, None)
-    except Exception:
-        pass
+            else:
+                # Log buffer status
+                remaining = bot.batch_window_sec - idle
+                remaining_min = int(remaining // 60)
+                remaining_sec = int(remaining % 60)
+                if len(buf.get("texts", [])) > 0:
+                    print(f"⏳ Buffer for {buf.get('sender_name', chat_jid)}: {len(buf['texts'])} message(s), waiting {remaining_min}m {remaining_sec}s more...", flush=True)
+    except Exception as e:
+        print(f"❌ Error in flush_ready_buffers: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
     return enqueued_any
 
 
