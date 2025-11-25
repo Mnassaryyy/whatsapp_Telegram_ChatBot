@@ -8,6 +8,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Dict, Any
 
+from openai import RateLimitError
+
 from .ai_utils import generate_ai_reply
 
 
@@ -67,11 +69,22 @@ def flush_ready_buffers(bot, joiner: str = " \n") -> bool:
                     bot.enqueue_item(last_msg_id, chat_jid, sender_name, combined, "", "", ai_reply, row_number)
                     print(f"✅ Enqueued message from {sender_name} for Telegram", flush=True)
                     enqueued_any = True
+                    bot.incoming_buffers.pop(chat_jid, None)
+                except RateLimitError as e:
+                    error_msg = str(e)
+                    if "insufficient_quota" in error_msg.lower() or "quota" in error_msg.lower():
+                        print(f"⚠️  OpenAI quota exceeded! Keeping buffer for retry. Please check your OpenAI billing.", flush=True)
+                        print(f"   Buffer will be retried when quota is restored. Message: {combined[:50]}...", flush=True)
+                    else:
+                        print(f"⚠️  OpenAI rate limit hit! Keeping buffer for retry. Will retry later.", flush=True)
+                    # Keep buffer for retry - don't pop it
                 except Exception as e:
-                    print(f"❌ Error flushing buffer: {e}", flush=True)
+                    error_msg = str(e)
+                    print(f"❌ Error flushing buffer: {error_msg}", flush=True)
                     import traceback
                     traceback.print_exc()
-                bot.incoming_buffers.pop(chat_jid, None)
+                    # For other errors, still clear buffer to avoid infinite retry
+                    bot.incoming_buffers.pop(chat_jid, None)
             else:
                 # Log buffer status
                 remaining = bot.batch_window_sec - idle
