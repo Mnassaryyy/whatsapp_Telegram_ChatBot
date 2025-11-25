@@ -60,6 +60,11 @@ class WhatsAppAIBot:
         self.pending_approvals = {}  # Store pending AI replies
         self.processed_message_ids = set()  # Track processed message IDs to avoid duplicates
         self.first_card_sent = False  # Controls timestamp wording on first presented item
+        
+        # Store config values as attributes for use in helper functions
+        self.DATABASE_PATH = DATABASE_PATH
+        self.MAX_CONVERSATION_HISTORY = MAX_CONVERSATION_HISTORY
+        
         # Batch window (seconds) for concatenating short/fragmented texts before AI
         # Default 20 minutes, can be overridden with BATCH_WINDOW_SEC env var
         batch_window = os.getenv("BATCH_WINDOW_SEC", "1200")
