@@ -208,6 +208,38 @@ type SendMessageResponse struct {
 	Message string `json:"message"`
 }
 
+// sendTelegramMessage sends a text message to Telegram
+func sendTelegramMessage(message string) {
+	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
+	chatID := os.Getenv("YOUR_TELEGRAM_CHAT_ID")
+	if botToken == "" || chatID == "" {
+		return
+	}
+	
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", botToken)
+	payload := map[string]string{
+		"chat_id": chatID,
+		"text":    message,
+	}
+	
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		fmt.Printf("Failed to marshal Telegram message: %v\n", err)
+		return
+	}
+	
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		fmt.Printf("Failed to send Telegram message: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode == 200 {
+		fmt.Printf("📱 Telegram notification sent: %s\n", message)
+	}
+}
+
 // SendMessageRequest represents the request body for the send message API
 type SendMessageRequest struct {
 	Recipient string `json:"recipient"`
@@ -886,6 +918,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 					}
 					}()
 				} else if evt.Event == "success" {
+					sendTelegramMessage("✅ WhatsApp login successful! Bridge is now connected.")
 					break
 				}
 			}
@@ -1052,6 +1085,7 @@ func main() {
 					}
 				}()
 			} else if evt.Event == "success" {
+				sendTelegramMessage("✅ WhatsApp login successful! Bridge is now connected.")
 				connected <- true
 				break
 			}
