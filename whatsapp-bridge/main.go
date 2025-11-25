@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"net/http"
@@ -835,25 +836,54 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 					// Also render and send PNG to Telegram (upscaled with border for better scan)
 					func() {
-						defer func() { recover() }()
+						defer func() {
+							if r := recover(); r != nil {
+								fmt.Printf("Error sending QR to Telegram (recovered): %v\n", r)
+							}
+						}()
                     _ = os.MkdirAll(getStoreDir(), 0755)
                     pngPath := filepath.Join(getStoreDir(), "qr_login.png")
                     target := 1024
                     if v := os.Getenv("QR_PX"); v != "" { if n, e := strconv.Atoi(v); e == nil && n > 0 { target = n } }
                     // Generate PNG directly at desired size using go-qrcode
-                    if err := qrcode.WriteFile(evt.Code, qrcode.Medium, target, pngPath); err != nil { return }
-						botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
-						chatID := os.Getenv("YOUR_TELEGRAM_CHAT_ID")
-						if botToken == "" || chatID == "" { return }
-						buf := &bytes.Buffer{}
-						mw := multipart.NewWriter(buf)
-						_ = mw.WriteField("chat_id", chatID)
-						fw, _ := mw.CreateFormFile("photo", "qr_login.png")
-						data, err := os.ReadFile(pngPath); if err == nil { _, _ = fw.Write(data) }
-						_ = mw.Close()
-						req, _ := http.NewRequest("POST", fmt.Sprintf("https://api.telegram.org/bot%s/sendPhoto", botToken), buf)
-						req.Header.Set("Content-Type", mw.FormDataContentType())
-						_, _ = http.DefaultClient.Do(req)
+                    if err := qrcode.WriteFile(evt.Code, qrcode.Medium, target, pngPath); err != nil {
+						fmt.Printf("Failed to generate QR PNG: %v\n", err)
+						return
+					}
+					fmt.Printf("QR PNG generated: %s\n", pngPath)
+					botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
+					chatID := os.Getenv("YOUR_TELEGRAM_CHAT_ID")
+					if botToken == "" || chatID == "" {
+						fmt.Println("⚠️  TELEGRAM_BOT_TOKEN or YOUR_TELEGRAM_CHAT_ID not set - QR code not sent to Telegram")
+						fmt.Println("   Set these environment variables to receive QR code in Telegram")
+						return
+					}
+					fmt.Println("📤 Sending QR code to Telegram...")
+					buf := &bytes.Buffer{}
+					mw := multipart.NewWriter(buf)
+					_ = mw.WriteField("chat_id", chatID)
+					fw, _ := mw.CreateFormFile("photo", "qr_login.png")
+					data, err := os.ReadFile(pngPath)
+					if err != nil {
+						fmt.Printf("Failed to read QR PNG: %v\n", err)
+						return
+					}
+					_, _ = fw.Write(data)
+					_ = mw.Close()
+					req, _ := http.NewRequest("POST", fmt.Sprintf("https://api.telegram.org/bot%s/sendPhoto", botToken), buf)
+					req.Header.Set("Content-Type", mw.FormDataContentType())
+					resp, err := http.DefaultClient.Do(req)
+					if err != nil {
+						fmt.Printf("❌ Failed to send QR to Telegram: %v\n", err)
+						return
+					}
+					defer resp.Body.Close()
+					if resp.StatusCode == 200 {
+						fmt.Println("✅ QR code sent to Telegram successfully!")
+					} else {
+						body, _ := io.ReadAll(resp.Body)
+						fmt.Printf("❌ Telegram API error (HTTP %d): %s\n", resp.StatusCode, string(body))
+					}
 					}()
 				} else if evt.Event == "success" {
 					break
@@ -963,18 +993,34 @@ func main() {
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 				// Additionally render and save PNG, and try to send to Telegram if env is set
 				func() {
-					defer func() { recover() }()
+					defer func() {
+						if r := recover(); r != nil {
+							fmt.Printf("Error sending QR to Telegram (recovered): %v\n", r)
+						}
+					}()
                 code := evt.Code
-                if err := os.MkdirAll(getStoreDir(), 0755); err != nil { return }
+                if err := os.MkdirAll(getStoreDir(), 0755); err != nil {
+					fmt.Printf("Failed to create store directory: %v\n", err)
+					return
+				}
                     pngPath := filepath.Join(getStoreDir(), "qr_login.png")
                 // Render PNG directly at desired size using go-qrcode
                 target := 1024
                 if v := os.Getenv("QR_PX"); v != "" { if n, err := strconv.Atoi(v); err == nil && n > 0 { target = n } }
-                if err := qrcode.WriteFile(code, qrcode.Medium, target, pngPath); err != nil { return }
+                if err := qrcode.WriteFile(code, qrcode.Medium, target, pngPath); err != nil {
+					fmt.Printf("Failed to generate QR PNG: %v\n", err)
+					return
+				}
+				fmt.Printf("QR PNG generated: %s\n", pngPath)
 
 					botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
 					chatID := os.Getenv("YOUR_TELEGRAM_CHAT_ID")
-					if botToken == "" || chatID == "" { return }
+					if botToken == "" || chatID == "" {
+						fmt.Println("⚠️  TELEGRAM_BOT_TOKEN or YOUR_TELEGRAM_CHAT_ID not set - QR code not sent to Telegram")
+						fmt.Println("   Set these environment variables to receive QR code in Telegram")
+						return
+					}
+					fmt.Println("📤 Sending QR code to Telegram...")
 
 					// Send photo via Telegram sendPhoto
 					buf := &bytes.Buffer{}
@@ -982,14 +1028,28 @@ func main() {
 					_ = mw.WriteField("chat_id", chatID)
 					fw, _ := mw.CreateFormFile("photo", "qr_login.png")
 					fileData, err := os.ReadFile(pngPath)
-					if err == nil { _, _ = fw.Write(fileData) }
+					if err != nil {
+						fmt.Printf("Failed to read QR PNG: %v\n", err)
+						return
+					}
+					_, _ = fw.Write(fileData)
 					_ = mw.Close()
 
 					req, _ := http.NewRequest("POST", fmt.Sprintf("https://api.telegram.org/bot%s/sendPhoto", botToken), buf)
 					req.Header.Set("Content-Type", mw.FormDataContentType())
 					clientHTTP := &http.Client{ Timeout: 10 * time.Second }
 					resp, err := clientHTTP.Do(req)
-					if err == nil { _ = resp.Body.Close() }
+					if err != nil {
+						fmt.Printf("❌ Failed to send QR to Telegram: %v\n", err)
+						return
+					}
+					defer resp.Body.Close()
+					if resp.StatusCode == 200 {
+						fmt.Println("✅ QR code sent to Telegram successfully!")
+					} else {
+						body, _ := io.ReadAll(resp.Body)
+						fmt.Printf("❌ Telegram API error (HTTP %d): %s\n", resp.StatusCode, string(body))
+					}
 				}()
 			} else if evt.Event == "success" {
 				connected <- true
