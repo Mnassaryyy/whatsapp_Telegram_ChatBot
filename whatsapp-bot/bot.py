@@ -172,8 +172,10 @@ class WhatsAppAIBot:
                 LEFT JOIN chats c ON m.chat_jid = c.jid
                 WHERE m.timestamp > ? 
                 AND m.is_from_me = 0
-                      AND (m.content != '' OR m.media_type != '')
-                    ORDER BY m.timestamp ASC
+                AND (m.content != '' OR m.media_type != '')
+                AND m.chat_jid NOT LIKE '%@broadcast'
+                AND m.chat_jid NOT LIKE '%status%'
+                ORDER BY m.timestamp ASC
             """
             
             cursor.execute(query, (timestamp_str,))

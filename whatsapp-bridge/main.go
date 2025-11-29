@@ -455,8 +455,13 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
-	// Save message to database
+	// Skip status/broadcast messages (WhatsApp status updates)
 	chatJID := msg.Info.Chat.String()
+	if strings.Contains(chatJID, "@broadcast") || strings.Contains(chatJID, "status") {
+		return // Skip status messages
+	}
+	
+	// Save message to database
 	sender := msg.Info.Sender.User
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
@@ -1237,6 +1242,11 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		}
 
 		chatJID := *conversation.ID
+
+		// Skip status/broadcast messages (WhatsApp status updates)
+		if strings.Contains(chatJID, "@broadcast") || strings.Contains(chatJID, "status") {
+			continue // Skip status messages
+		}
 
 		// Try to parse the JID
 		jid, err := types.ParseJID(chatJID)
