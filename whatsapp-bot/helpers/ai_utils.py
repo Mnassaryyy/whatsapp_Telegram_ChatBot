@@ -125,9 +125,20 @@ def _generate_ai_reply_assistants(bot, sender_jid: str, message_text: str, assis
         return None
         
     except Exception as e:
-        print(f"❌ Error running assistant: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
+        error_msg = str(e)
+        error_str_lower = error_msg.lower()
+        
+        # Check for 404/NotFound errors specifically
+        if "404" in error_msg or "not found" in error_str_lower or "no assistant found" in error_str_lower:
+            print(f"❌ OpenAI Assistant not found (404): {error_msg}", flush=True)
+            print(f"   Please check your OPENAI_ASSISTANT_ID in .env file", flush=True)
+            print(f"   Current Assistant ID: {assistant_id}", flush=True)
+            print(f"   Tip: Verify the Assistant exists in your OpenAI dashboard at https://platform.openai.com/assistants", flush=True)
+            print(f"   You can also switch to Chat Completions API by setting OPENAI_API_MODE=chat in .env", flush=True)
+        else:
+            print(f"❌ Error running assistant: {error_msg}", flush=True)
+            import traceback
+            traceback.print_exc()
         return None
 
 
@@ -143,12 +154,19 @@ def generate_ai_reply(bot, sender_jid: str, message_text: str) -> str:
     """
     if OPENAI_API_MODE.lower() == "assistants":
         if not OPENAI_ASSISTANT_ID:
-            raise ValueError("OPENAI_ASSISTANT_ID is required when using Assistants API mode")
+            print("⚠️  OPENAI_ASSISTANT_ID is not set. Falling back to Chat Completions API.", flush=True)
+        else:
+            reply = _generate_ai_reply_assistants(bot, sender_jid, message_text, OPENAI_ASSISTANT_ID)
+            if reply is not None:
+                return reply
+            else:
+                print("⚠️  Assistants API failed. Falling back to Chat Completions API.", flush=True)
         
-        reply = _generate_ai_reply_assistants(bot, sender_jid, message_text, OPENAI_ASSISTANT_ID)
-        if reply is None:
-            raise Exception("Failed to generate reply using Assistants API")
-        return reply
+        # Fallback to Chat Completions if Assistants API fails or is not configured
+        print(f"   Using Chat Completions API with model: {OPENAI_MODEL}", flush=True)
+        context_messages = _build_context_messages(bot, sender_jid, bot.MAX_CONVERSATION_HISTORY)
+        response = bot.client.chat.completions.create(model=OPENAI_MODEL, messages=context_messages)
+        return response.choices[0].message.content
     else:
         # Default: Use Chat Completions API
         context_messages = _build_context_messages(bot, sender_jid, bot.MAX_CONVERSATION_HISTORY)
