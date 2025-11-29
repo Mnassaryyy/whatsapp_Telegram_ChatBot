@@ -42,6 +42,9 @@ def _build_context_messages(bot, sender_jid: str, max_messages: int) -> List[Dic
 
     messages: List[Dict[str, str]] = [{"role": "system", "content": AI_SYSTEM_PROMPT}]
     for msg_content, is_from_me, _ in reversed(history):
+        # Skip empty messages (e.g., voice messages that haven't been transcribed yet)
+        if not msg_content or not msg_content.strip():
+            continue
         role = "assistant" if is_from_me else "user"
         messages.append({"role": role, "content": msg_content})
     return messages
@@ -165,11 +168,15 @@ def generate_ai_reply(bot, sender_jid: str, message_text: str) -> str:
         # Fallback to Chat Completions if Assistants API fails or is not configured
         print(f"   Using Chat Completions API with model: {OPENAI_MODEL}", flush=True)
         context_messages = _build_context_messages(bot, sender_jid, bot.MAX_CONVERSATION_HISTORY)
+        # Add the current message to the context (important for transcribed voice messages that aren't in DB yet)
+        context_messages.append({"role": "user", "content": message_text})
         response = bot.client.chat.completions.create(model=OPENAI_MODEL, messages=context_messages)
         return response.choices[0].message.content
     else:
         # Default: Use Chat Completions API
         context_messages = _build_context_messages(bot, sender_jid, bot.MAX_CONVERSATION_HISTORY)
+        # Add the current message to the context (important for transcribed voice messages that aren't in DB yet)
+        context_messages.append({"role": "user", "content": message_text})
         response = bot.client.chat.completions.create(model=OPENAI_MODEL, messages=context_messages)
         return response.choices[0].message.content
 
