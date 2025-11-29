@@ -3,6 +3,7 @@
 This module encapsulates:
 - Conversation context building from SQLite
 - Chat completion invocation with the system prompt
+- OpenAI Assistants API integration (thread-based)
 - Voice download (via bridge) and transcription (Whisper)
 """
 
@@ -11,7 +12,11 @@ from __future__ import annotations
 from typing import List, Dict, Optional, Tuple
 import sqlite3
 import requests
-from config import OPENAI_MODEL, AI_SYSTEM_PROMPT, WHATSAPP_API_URL, WHISPER_LANGUAGE
+import time
+from config import (
+    OPENAI_MODEL, AI_SYSTEM_PROMPT, WHATSAPP_API_URL, WHISPER_LANGUAGE,
+    OPENAI_API_MODE, OPENAI_ASSISTANT_ID
+)
 
 
 def _build_context_messages(bot, sender_jid: str, max_messages: int) -> List[Dict[str, str]]:
@@ -42,14 +47,113 @@ def _build_context_messages(bot, sender_jid: str, max_messages: int) -> List[Dic
     return messages
 
 
-def generate_ai_reply(bot, sender_jid: str, message_text: str) -> str:
-    """Generate an AI reply using OpenAI chat completions.
-
-    Context is retrieved from the local SQLite database for the given chat.
+def _generate_ai_reply_assistants(bot, sender_jid: str, message_text: str, assistant_id: str) -> Optional[str]:
+    """Generate an AI reply using OpenAI Assistants API (thread-based).
+    
+    Based on the assistant_upgrade_position pattern - uses threads for conversation management.
+    
+    Args:
+        bot: The bot instance
+        sender_jid: The WhatsApp chat JID (used as thread identifier)
+        message_text: The user's message
+        assistant_id: The OpenAI Assistant ID to use
+    
+    Returns:
+        The assistant's reply text, or None on error
     """
-    context_messages = _build_context_messages(bot, sender_jid, bot.MAX_CONVERSATION_HISTORY)
-    response = bot.client.chat.completions.create(model=OPENAI_MODEL, messages=context_messages)
-    return response.choices[0].message.content
+    try:
+        # Step 1: Check if we have an existing thread for this chat, otherwise create new one
+        # Using sender_jid as a unique identifier per chat
+        thread_id = getattr(bot, '_assistant_threads', {}).get(sender_jid)
+        
+        if not thread_id:
+            # Create a new thread for this chat
+            thread = bot.client.beta.threads.create()
+            thread_id = thread.id
+            
+            # Store thread ID for future messages in this chat
+            if not hasattr(bot, '_assistant_threads'):
+                bot._assistant_threads = {}
+            bot._assistant_threads[sender_jid] = thread_id
+        
+        # Step 2: Add the user's message to the thread
+        bot.client.beta.threads.messages.create(
+            thread_id=thread_id,
+            role="user",
+            content=message_text
+        )
+        
+        # Step 3: Run the assistant on that thread
+        run = bot.client.beta.threads.runs.create(
+            thread_id=thread_id,
+            assistant_id=assistant_id
+        )
+        
+        # Step 4: Wait for the assistant to finish processing
+        max_wait = 60  # Maximum 60 seconds
+        wait_time = 0
+        while wait_time < max_wait:
+            run_status = bot.client.beta.threads.runs.retrieve(
+                thread_id=thread_id,
+                run_id=run.id
+            )
+            
+            if run_status.status == "completed":
+                break
+            elif run_status.status in ["failed", "cancelled", "expired"]:
+                print(f"⚠️  Assistant run failed with status: {run_status.status}", flush=True)
+                return None
+            
+            time.sleep(1)  # Wait 1 second before checking again
+            wait_time += 1
+        
+        if wait_time >= max_wait:
+            print(f"⚠️  Assistant run timed out after {max_wait} seconds", flush=True)
+            return None
+        
+        # Step 5: Retrieve the final messages
+        messages = bot.client.beta.threads.messages.list(thread_id=thread_id)
+        
+        # Step 6: Extract the assistant's latest message
+        for message in reversed(messages.data):
+            if message.role == "assistant":
+                if message.content and len(message.content) > 0:
+                    response_text = message.content[0].text.value
+                    return response_text
+        
+        print("⚠️  No assistant response found in thread", flush=True)
+        return None
+        
+    except Exception as e:
+        print(f"❌ Error running assistant: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def generate_ai_reply(bot, sender_jid: str, message_text: str) -> str:
+    """Generate an AI reply using either Chat Completions or Assistants API.
+    
+    Context is retrieved from the local SQLite database for the given chat (Chat Completions mode).
+    Thread-based conversation management is used in Assistants API mode.
+    
+    The mode is determined by OPENAI_API_MODE config:
+    - "chat" (default): Uses Chat Completions API with manual context building
+    - "assistants": Uses Assistants API with thread-based conversations
+    """
+    if OPENAI_API_MODE.lower() == "assistants":
+        if not OPENAI_ASSISTANT_ID:
+            raise ValueError("OPENAI_ASSISTANT_ID is required when using Assistants API mode")
+        
+        reply = _generate_ai_reply_assistants(bot, sender_jid, message_text, OPENAI_ASSISTANT_ID)
+        if reply is None:
+            raise Exception("Failed to generate reply using Assistants API")
+        return reply
+    else:
+        # Default: Use Chat Completions API
+        context_messages = _build_context_messages(bot, sender_jid, bot.MAX_CONVERSATION_HISTORY)
+        response = bot.client.chat.completions.create(model=OPENAI_MODEL, messages=context_messages)
+        return response.choices[0].message.content
 
 
 def transcribe_voice_message(bot, message_id: str, chat_jid: str) -> Optional[str]:

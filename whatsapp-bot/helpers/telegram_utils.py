@@ -35,8 +35,14 @@ def build_full_approval_keyboard(message_id: str) -> InlineKeyboardMarkup:
         InlineKeyboardButton("🎤 Record Own", callback_data=f"record_{message_id}"),
         InlineKeyboardButton("✍️ Custom Message", callback_data=f"custom_{message_id}"),
         InlineKeyboardButton("🕓 Reply Later", callback_data=f"later_{message_id}"),
+    ], [
+        InlineKeyboardButton("🚫 Block User", callback_data=f"block_{message_id}"),
     ]]
     return InlineKeyboardMarkup(keyboard)
+
+
+
+
 
 
 

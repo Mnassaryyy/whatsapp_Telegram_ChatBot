@@ -84,7 +84,7 @@ def flush_ready_buffers(bot, joiner: str = " \n") -> bool:
                     import traceback
                     traceback.print_exc()
                     # For other errors, still clear buffer to avoid infinite retry
-                    bot.incoming_buffers.pop(chat_jid, None)
+                bot.incoming_buffers.pop(chat_jid, None)
             else:
                 # Log buffer status
                 remaining = bot.batch_window_sec - idle

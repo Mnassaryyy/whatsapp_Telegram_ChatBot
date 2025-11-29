@@ -39,7 +39,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 import asyncio
 from config import *
-from helpers import ai_utils, media_utils, queue_utils, batch_utils, telegram_utils, whatsapp_api
+from helpers import ai_utils, media_utils, queue_utils, batch_utils, telegram_utils, whatsapp_api, subscription_utils, blacklist_utils
 import logging
 
 logging.basicConfig(
@@ -76,6 +76,9 @@ class WhatsAppAIBot:
         # Per-chat buffer: chat_jid -> {texts: [str], last_msg_id: str, sender_name: str, last_timestamp: datetime}
         self.incoming_buffers = {}
         
+        # Assistant threads cache (for Assistants API mode): chat_jid -> thread_id
+        self._assistant_threads = {}
+        
         # Google Sheets setup
         scopes = ['https://www.googleapis.com/auth/spreadsheets']
         creds = Credentials.from_service_account_file(GOOGLE_SHEETS_CREDENTIALS_FILE, scopes=scopes)
@@ -104,11 +107,16 @@ class WhatsAppAIBot:
         self.telegram_app.add_handler(CommandHandler("login", self.cmd_login))
         self.telegram_app.add_handler(CommandHandler("queue", self.cmd_queue))
         self.telegram_app.add_handler(CommandHandler("next", self.cmd_next))
+        self.telegram_app.add_handler(CommandHandler("subscription", self.cmd_subscription))
+        self.telegram_app.add_handler(CommandHandler("set_tier", self.cmd_set_tier))
         self.telegram_app.add_handler(CallbackQueryHandler(self.handle_approve, pattern=r"^approve_"))
         self.telegram_app.add_handler(CallbackQueryHandler(self.handle_record_own, pattern=r"^record_"))
         self.telegram_app.add_handler(CallbackQueryHandler(self.handle_reject, pattern=r"^reject_"))
         self.telegram_app.add_handler(CallbackQueryHandler(self.handle_reply_later, pattern=r"^later_"))
         self.telegram_app.add_handler(CallbackQueryHandler(self.handle_custom_init, pattern=r"^custom_"))
+        self.telegram_app.add_handler(CallbackQueryHandler(self.handle_block_user, pattern=r"^block_"))
+        self.telegram_app.add_handler(CommandHandler("blacklist", self.cmd_blacklist))
+        self.telegram_app.add_handler(CommandHandler("unblock", self.cmd_unblock))
         self.telegram_app.add_handler(MessageHandler(filters.VOICE, self.handle_voice))
         self.telegram_app.add_handler(MessageHandler(filters.PHOTO, self.handle_custom_photo))
         self.telegram_app.add_handler(MessageHandler(filters.Document.ALL, self.handle_custom_document))
@@ -142,6 +150,14 @@ class WhatsAppAIBot:
             conn.close()
         except Exception as e:
             print(f"Failed to ensure queue table: {e}", flush=True)
+        
+        # Initialize subscriptions table
+        subscription_utils.init_subscriptions_table(DATABASE_PATH)
+        print("✅ Subscriptions table initialized", flush=True)
+        
+        # Initialize blacklist table
+        blacklist_utils.init_blacklist_table(DATABASE_PATH)
+        print("✅ Blacklist table initialized", flush=True)
     
     # ==================== Batch Buffer Helpers ====================
     def _buffer_add_text(self, chat_jid: str, msg_id: str, sender_name: str, text: str, timestamp):
@@ -311,10 +327,16 @@ class WhatsAppAIBot:
         except Exception:
             pass
 
+        # Get subscription tier for display
+        tier = subscription_utils.get_subscription_tier(DATABASE_PATH, chat_jid)
+        tier_display = tier.value.upper()
+        tier_emoji = {"FREE": "🆓", "BASIC": "🥉", "PREMIUM": "💎"}.get(tier_display, "📋")
+        
         text = f"""🔔 *New WhatsApp Message*
 
 👤 *From:* {sender_name or chat_jid}
 📱 *Number:* {chat_jid}
+🎯 *Subscription:* {tier_emoji} {tier_display}
 {sent_line}
 
 💬 *Message:*
@@ -379,10 +401,16 @@ class WhatsAppAIBot:
         """Send a simplified notification card to Telegram (used in some flows)."""
         message_type = "🎤 *Voice Message (Transcribed)*" if is_voice else "💬 *Message:*"
         
+        # Get subscription tier for display
+        tier = subscription_utils.get_subscription_tier(DATABASE_PATH, sender_id)
+        tier_display = tier.value.upper()
+        tier_emoji = {"FREE": "🆓", "BASIC": "🥉", "PREMIUM": "💎"}.get(tier_display, "📋")
+        
         text = f"""🔔 *New WhatsApp Message*
         
 👤 *From:* {sender_name or sender_id}
 📱 *Number:* {sender_id}
+🎯 *Subscription:* {tier_emoji} {tier_display}
 
 {message_type}
 {incoming_msg}
@@ -742,6 +770,80 @@ class WhatsAppAIBot:
         context.user_data.pop('custom_target', None)
         nxt = self.activate_next_pending()
         if nxt: await self.present_active_item(nxt)
+    async def handle_block_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle Block User button click - blocks the user from sending messages."""
+        query = update.callback_query
+        try:
+            await query.answer()
+        except Exception as e:
+            print(f"query.answer failed: {e}", flush=True)
+        
+        message_id = query.data.replace("block_", "")
+        print(f"\n🚫 [BLOCK USER BUTTON CLICKED]\nMessage ID: {message_id}\n", flush=True)
+        
+        try:
+            # Get chat_jid from queue item
+            conn = sqlite3.connect(DATABASE_PATH)
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT chat_jid, sender_name FROM queue_items WHERE message_id = ? ORDER BY id DESC LIMIT 1",
+                (message_id,)
+            )
+            result = cur.fetchone()
+            conn.close()
+            
+            if not result:
+                await query.edit_message_text("❌ Could not find message. User not blocked.")
+                return
+            
+            chat_jid, sender_name = result
+            
+            # Check if already blacklisted
+            if blacklist_utils.is_blacklisted(DATABASE_PATH, chat_jid):
+                await query.edit_message_text(
+                    f"⚠️ User `{sender_name or chat_jid}` is already blacklisted.",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            # Add to blacklist
+            success = blacklist_utils.add_to_blacklist(
+                DATABASE_PATH,
+                chat_jid,
+                reason="Blocked from Telegram",
+                notes=f"Blocked via message ID: {message_id}"
+            )
+            
+            if success:
+                # Remove from queue if active/pending
+                conn = sqlite3.connect(DATABASE_PATH)
+                cur = conn.cursor()
+                cur.execute(
+                    "UPDATE queue_items SET status='done' WHERE message_id = ?",
+                    (message_id,)
+                )
+                conn.commit()
+                conn.close()
+                
+                await query.edit_message_text(
+                    f"🚫 User `{sender_name or chat_jid}` has been **blocked**.\n\n"
+                    f"Future messages from this user will be automatically filtered.",
+                    parse_mode='Markdown'
+                )
+                print(f"✅ Blocked user: {sender_name or chat_jid}", flush=True)
+                
+                # Advance to next message
+                nxt = self.activate_next_pending()
+                if nxt:
+                    await self.present_active_item(nxt)
+            else:
+                await query.edit_message_text("❌ Failed to block user. Please try again.")
+        except Exception as e:
+            print(f"❌ Error blocking user: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            await query.edit_message_text(f"❌ Error: {e}")
+    
     async def handle_reject(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Reject the current message and move on without sending."""
         query = update.callback_query
@@ -797,7 +899,11 @@ class WhatsAppAIBot:
                 enqueued_any = False
                 active_before = self.get_active_item()
                 
-                for msg_id, sender_jid, sender, content, timestamp, sender_name, media_type in new_messages:
+                    for msg_id, sender_jid, sender, content, timestamp, sender_name, media_type in new_messages:
+                        # Skip blacklisted users
+                        if blacklist_utils.is_blacklisted(DATABASE_PATH, sender_jid):
+                            print(f"🚫 Skipping message from blacklisted user: {sender_name or sender_jid}", flush=True)
+                            continue
                     # Skip if already processed
                     if msg_id in self.processed_message_ids:
                         print(f"⏭️  Skipping already processed message: {msg_id}", flush=True)
@@ -967,6 +1073,272 @@ class WhatsAppAIBot:
             await update.message.reply_text("➡️ Moved to next message.")
         else:
             await update.message.reply_text("✅ Queue is empty.")
+    
+    async def cmd_subscription(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Display subscription information for a user."""
+        try:
+            if len(context.args) == 0:
+                await update.message.reply_text(
+                    "📋 Usage: `/subscription <phone_number_or_jid>`\n"
+                    "Example: `/subscription 1234567890` or `/subscription 1234567890@s.whatsapp.net`",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            identifier = context.args[0]
+            # Normalize to JID format if needed
+            if '@' not in identifier:
+                chat_jid = f"{identifier}@s.whatsapp.net"
+            else:
+                chat_jid = identifier
+            
+            info = subscription_utils.get_subscription_info(DATABASE_PATH, chat_jid)
+            if not info:
+                await update.message.reply_text(f"❌ Could not retrieve subscription info for {identifier}")
+                return
+            
+            tier = info['tier'].upper()
+            limit = info['daily_messages_limit']
+            used = info['daily_messages_used']
+            limit_str = "Unlimited" if limit == -1 else str(limit)
+            
+            voice = "✅" if info['voice_transcription'] else "❌"
+            priority = "✅" if info['priority_processing'] else "❌"
+            expired = " ⚠️ EXPIRED" if info['is_expired'] else ""
+            
+            message = f"""
+📊 *Subscription Information*
+
+👤 User: `{identifier}`
+🎯 Tier: *{tier}*{expired}
+
+📈 *Usage Today:*
+• Messages: {used} / {limit_str}
+
+✨ *Features:*
+• Voice Transcription: {voice}
+• Priority Processing: {priority}
+"""
+            if info['expires_at']:
+                message += f"\n⏰ Expires: {info['expires_at']}"
+            if info['notes']:
+                message += f"\n📝 Notes: {info['notes']}"
+            
+            await update.message.reply_text(message, parse_mode='Markdown')
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {e}")
+    
+    async def cmd_set_tier(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Set subscription tier for a user (Admin only)."""
+        try:
+            # Basic admin check - verify it's from authorized chat
+            if str(update.message.chat_id) != YOUR_TELEGRAM_CHAT_ID:
+                await update.message.reply_text("❌ Unauthorized. Only admins can set tiers.")
+                return
+            
+            if len(context.args) < 2:
+                await update.message.reply_text(
+                    "📋 Usage: `/set_tier <phone_or_jid> <tier>`\n"
+                    "Tiers: `free`, `basic`, `premium`\n"
+                    "Example: `/set_tier 1234567890 premium`",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            identifier = context.args[0]
+            tier_str = context.args[1].lower()
+            
+            # Normalize to JID format
+            if '@' not in identifier:
+                chat_jid = f"{identifier}@s.whatsapp.net"
+            else:
+                chat_jid = identifier
+            
+            # Validate tier
+            try:
+                tier = subscription_utils.SubscriptionTier(tier_str)
+            except ValueError:
+                await update.message.reply_text(
+                    f"❌ Invalid tier: `{tier_str}`\n"
+                    "Valid tiers: `free`, `basic`, `premium`",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            # Optional expiration date (YYYY-MM-DD)
+            expires_at = None
+            if len(context.args) >= 3:
+                try:
+                    expires_at = datetime.fromisoformat(context.args[2])
+                except ValueError:
+                    await update.message.reply_text("⚠️ Invalid date format. Use YYYY-MM-DD or leave empty for no expiration.")
+                    return
+            
+            # Optional notes
+            notes = " ".join(context.args[3:]) if len(context.args) > 3 else None
+            
+            success = subscription_utils.set_subscription_tier(
+                DATABASE_PATH, chat_jid, tier, expires_at, notes
+            )
+            
+            if success:
+                await update.message.reply_text(
+                    f"✅ Set subscription tier for `{identifier}` to *{tier_str.upper()}*",
+                    parse_mode='Markdown'
+                )
+            else:
+                await update.message.reply_text(f"❌ Failed to set subscription tier")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {e}")
+    
+    async def handle_block_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle Block User button click - blocks the user from sending messages."""
+        query = update.callback_query
+        try:
+            await query.answer()
+        except Exception as e:
+            print(f"query.answer failed: {e}", flush=True)
+        
+        message_id = query.data.replace("block_", "")
+        print(f"\n🚫 [BLOCK USER BUTTON CLICKED]\nMessage ID: {message_id}\n", flush=True)
+        
+        try:
+            # Get chat_jid from queue item
+            conn = sqlite3.connect(DATABASE_PATH)
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT chat_jid, sender_name FROM queue_items WHERE message_id = ? ORDER BY id DESC LIMIT 1",
+                (message_id,)
+            )
+            result = cur.fetchone()
+            conn.close()
+            
+            if not result:
+                await query.edit_message_text("❌ Could not find message. User not blocked.")
+                return
+            
+            chat_jid, sender_name = result
+            
+            # Check if already blacklisted
+            if blacklist_utils.is_blacklisted(DATABASE_PATH, chat_jid):
+                await query.edit_message_text(
+                    f"⚠️ User `{sender_name or chat_jid}` is already blacklisted.",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            # Add to blacklist
+            success = blacklist_utils.add_to_blacklist(
+                DATABASE_PATH,
+                chat_jid,
+                reason="Blocked from Telegram",
+                notes=f"Blocked via message ID: {message_id}"
+            )
+            
+            if success:
+                # Remove from queue if active/pending
+                conn = sqlite3.connect(DATABASE_PATH)
+                cur = conn.cursor()
+                cur.execute(
+                    "UPDATE queue_items SET status='done' WHERE message_id = ?",
+                    (message_id,)
+                )
+                conn.commit()
+                conn.close()
+                
+                await query.edit_message_text(
+                    f"🚫 User `{sender_name or chat_jid}` has been **blocked**.\n\n"
+                    f"Future messages from this user will be automatically filtered.",
+                    parse_mode='Markdown'
+                )
+                print(f"✅ Blocked user: {sender_name or chat_jid}", flush=True)
+                
+                # Advance to next message
+                nxt = self.activate_next_pending()
+                if nxt:
+                    await self.present_active_item(nxt)
+            else:
+                await query.edit_message_text("❌ Failed to block user. Please try again.")
+        except Exception as e:
+            print(f"❌ Error blocking user: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            await query.edit_message_text(f"❌ Error: {e}")
+    
+    async def cmd_blacklist(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """List all blacklisted users."""
+        try:
+            # Basic admin check
+            if str(update.message.chat_id) != YOUR_TELEGRAM_CHAT_ID:
+                await update.message.reply_text("❌ Unauthorized. Only admins can view blacklist.")
+                return
+            
+            blacklisted = blacklist_utils.list_blacklisted(DATABASE_PATH, limit=50)
+            
+            if not blacklisted:
+                await update.message.reply_text("✅ No users are currently blacklisted.")
+                return
+            
+            message = "🚫 *Blacklisted Users:*\n\n"
+            for i, user in enumerate(blacklisted, 1):
+                chat_jid = user['chat_jid']
+                blocked_at = user['blocked_at'] or "Unknown"
+                reason = user['reason'] or "No reason"
+                
+                # Extract phone number from JID
+                phone = chat_jid.split('@')[0] if '@' in chat_jid else chat_jid
+                
+                message += f"*{i}.* `{phone}`\n"
+                message += f"   Blocked: {blocked_at}\n"
+                if reason:
+                    message += f"   Reason: {reason}\n"
+                message += "\n"
+            
+            await update.message.reply_text(message, parse_mode='Markdown')
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {e}")
+    
+    async def cmd_unblock(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Unblock a user from the blacklist."""
+        try:
+            # Basic admin check
+            if str(update.message.chat_id) != YOUR_TELEGRAM_CHAT_ID:
+                await update.message.reply_text("❌ Unauthorized. Only admins can unblock users.")
+                return
+            
+            if len(context.args) == 0:
+                await update.message.reply_text(
+                    "📋 Usage: `/unblock <phone_number_or_jid>`\n"
+                    "Example: `/unblock 1234567890` or `/unblock 1234567890@s.whatsapp.net`",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            identifier = context.args[0]
+            # Normalize to JID format if needed
+            if '@' not in identifier:
+                chat_jid = f"{identifier}@s.whatsapp.net"
+            else:
+                chat_jid = identifier
+            
+            # Check if blacklisted
+            if not blacklist_utils.is_blacklisted(DATABASE_PATH, chat_jid):
+                await update.message.reply_text(f"ℹ️ User `{identifier}` is not blacklisted.", parse_mode='Markdown')
+                return
+            
+            # Remove from blacklist
+            success = blacklist_utils.remove_from_blacklist(DATABASE_PATH, chat_jid)
+            
+            if success:
+                await update.message.reply_text(
+                    f"✅ User `{identifier}` has been **unblocked**.\n\n"
+                    f"Messages from this user will now be processed normally.",
+                    parse_mode='Markdown'
+                )
+            else:
+                await update.message.reply_text(f"❌ Failed to unblock user. User may not be in blacklist.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {e}")
 
     async def run(self):
         """Main run method"""

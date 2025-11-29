@@ -11,6 +11,11 @@ WHATSAPP_API_URL = os.getenv("WHATSAPP_API_URL", "http://localhost:8080/api")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4")
 
+# OpenAI Assistants API Configuration (optional - for thread-based conversations)
+# Set to "assistants" to use Assistants API, or "chat" (default) for Chat Completions
+OPENAI_API_MODE = os.getenv("OPENAI_API_MODE", "chat")  # "chat" or "assistants"
+OPENAI_ASSISTANT_ID = os.getenv("OPENAI_ASSISTANT_ID", None)  # Required if using Assistants API
+
 # Telegram Configuration
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 YOUR_TELEGRAM_CHAT_ID = os.getenv("YOUR_TELEGRAM_CHAT_ID")
