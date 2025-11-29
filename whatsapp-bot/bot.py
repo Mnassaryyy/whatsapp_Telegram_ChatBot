@@ -895,17 +895,17 @@ class WhatsAppAIBot:
                 
                 if new_messages:
                     print(f"📨 Found {len(new_messages)} new message(s)", flush=True)
-                # Enqueue all first, then present one active to ensure pending count reflects full batch
-                enqueued_any = False
-                active_before = self.get_active_item()
-                
+                    # Enqueue all first, then present one active to ensure pending count reflects full batch
+                    enqueued_any = False
+                    active_before = self.get_active_item()
+                    
                     for msg_id, sender_jid, sender, content, timestamp, sender_name, media_type in new_messages:
                         # Skip blacklisted users
                         if blacklist_utils.is_blacklisted(DATABASE_PATH, sender_jid):
                             print(f"🚫 Skipping message from blacklisted user: {sender_name or sender_jid}", flush=True)
                             continue
-                    # Skip if already processed
-                    if msg_id in self.processed_message_ids:
+                        # Skip if already processed
+                        if msg_id in self.processed_message_ids:
                         print(f"⏭️  Skipping already processed message: {msg_id}", flush=True)
                         continue
                     
