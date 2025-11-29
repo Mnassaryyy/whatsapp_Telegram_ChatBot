@@ -906,91 +906,91 @@ class WhatsAppAIBot:
                             continue
                         # Skip if already processed
                         if msg_id in self.processed_message_ids:
-                        print(f"⏭️  Skipping already processed message: {msg_id}", flush=True)
-                        continue
-                    
-                    # Mark as processed
-                    self.processed_message_ids.add(msg_id)
-                    print(f"✅ Marked message {msg_id} as processed", flush=True)
-                    
-                    # Keep the set size manageable (keep last 1000 message IDs)
-                    if len(self.processed_message_ids) > 1000:
-                        self.processed_message_ids.pop()
-                    
-                    # Update last processed timestamp (convert from string to datetime)
-                    if isinstance(timestamp, str):
-                        from datetime import datetime
-                        self.last_processed_timestamp = datetime.fromisoformat(timestamp.replace(' ', 'T'))
-                    else:
-                        self.last_processed_timestamp = timestamp
-                    
-                    # Handle media: keep audio path unchanged; handle images/videos/documents to Telegram
-                    is_voice = False
-                    if media_type == 'audio' and not content:
-                        is_voice = True
-                        print(f"🎤 Transcribing voice message from {sender_name or sender}...", flush=True)
-                        content = self.transcribe_voice_message(msg_id, sender_jid)
-                        if content:
-                            print(f"Transcription: {content}", flush=True)
-                        else:
-                            print("Failed to transcribe voice message, skipping...", flush=True)
+                            print(f"⏭️  Skipping already processed message: {msg_id}", flush=True)
                             continue
-                        # For voice (transcribed text), add to buffer and defer AI generation
-                        self._buffer_add_text(sender_jid, msg_id, sender_name, content, timestamp)
-                        # Do not enqueue now; will be flushed when idle
-                        continue
-                    elif media_type in ("image", "video", "document"):
-                        ok, _, filename, path = self.download_media(msg_id, sender_jid)
-                        if ok and path:
-                            age = "just now"
-                            try:
-                                t = timestamp if not isinstance(timestamp, str) else datetime.fromisoformat(timestamp.replace(' ', 'T'))
-                                delta = datetime.now() - t
-                                mins = int(delta.total_seconds() // 60)
-                                if mins < 1:
-                                    age = "just now"
-                                elif mins < 60:
-                                    age = f"{mins}m ago"
-                                else:
-                                    hours = mins // 60
-                                    age = f"{hours}h ago"
-                            except Exception:
-                                pass
-                            size_str = self.format_size(self.get_media_size_bytes(msg_id, sender_jid))
-                            name_part = f"\nFile: {filename}" if filename else ""
-                            caption = f"📎 Media from {sender_name or sender}{name_part}\nType: {media_type}\nSize: {size_str}\nReceived: {age}"
-                            await self.send_telegram_media(media_type, path, caption)
-                            # Carry this path forward to enqueue
-                            media_path_for_enqueue = path
+                        
+                        # Mark as processed
+                        self.processed_message_ids.add(msg_id)
+                        print(f"✅ Marked message {msg_id} as processed", flush=True)
+                        
+                        # Keep the set size manageable (keep last 1000 message IDs)
+                        if len(self.processed_message_ids) > 1000:
+                            self.processed_message_ids.pop()
+                        
+                        # Update last processed timestamp (convert from string to datetime)
+                        if isinstance(timestamp, str):
+                            from datetime import datetime
+                            self.last_processed_timestamp = datetime.fromisoformat(timestamp.replace(' ', 'T'))
                         else:
-                            media_path_for_enqueue = ""
+                            self.last_processed_timestamp = timestamp
+                        
+                        # Handle media: keep audio path unchanged; handle images/videos/documents to Telegram
+                        is_voice = False
+                        if media_type == 'audio' and not content:
+                            is_voice = True
+                            print(f"🎤 Transcribing voice message from {sender_name or sender}...", flush=True)
+                            content = self.transcribe_voice_message(msg_id, sender_jid)
+                            if content:
+                                print(f"Transcription: {content}", flush=True)
+                            else:
+                                print("Failed to transcribe voice message, skipping...", flush=True)
+                                continue
+                            # For voice (transcribed text), add to buffer and defer AI generation
+                            self._buffer_add_text(sender_jid, msg_id, sender_name, content, timestamp)
+                            # Do not enqueue now; will be flushed when idle
+                            continue
+                        elif media_type in ("image", "video", "document"):
+                            ok, _, filename, path = self.download_media(msg_id, sender_jid)
+                            if ok and path:
+                                age = "just now"
+                                try:
+                                    t = timestamp if not isinstance(timestamp, str) else datetime.fromisoformat(timestamp.replace(' ', 'T'))
+                                    delta = datetime.now() - t
+                                    mins = int(delta.total_seconds() // 60)
+                                    if mins < 1:
+                                        age = "just now"
+                                    elif mins < 60:
+                                        age = f"{mins}m ago"
+                                    else:
+                                        hours = mins // 60
+                                        age = f"{hours}h ago"
+                                except Exception:
+                                    pass
+                                size_str = self.format_size(self.get_media_size_bytes(msg_id, sender_jid))
+                                name_part = f"\nFile: {filename}" if filename else ""
+                                caption = f"📎 Media from {sender_name or sender}{name_part}\nType: {media_type}\nSize: {size_str}\nReceived: {age}"
+                                await self.send_telegram_media(media_type, path, caption)
+                                # Carry this path forward to enqueue
+                                media_path_for_enqueue = path
+                            else:
+                                media_path_for_enqueue = ""
 
-                    print(f"\n📨 Processing message from {sender_name or sender}: {content}", flush=True)
+                        print(f"\n📨 Processing message from {sender_name or sender}: {content}", flush=True)
 
-                    # If this is a plain text (or non-media) message, add to buffer and defer AI
-                    if media_type not in ("image", "video", "document"):
-                        self._buffer_add_text(sender_jid, msg_id, sender_name, content or "", timestamp)
-                        buf = self.incoming_buffers.get(sender_jid)
-                        if buf:
-                            print(f"📝 Added to buffer (will wait {self.batch_window_sec // 60} min). Buffer now has {len(buf.get('texts', []))} message(s)", flush=True)
-                        # Do not enqueue immediately; batching will flush later
-                        continue
+                        # If this is a plain text (or non-media) message, add to buffer and defer AI
+                        if media_type not in ("image", "video", "document"):
+                            self._buffer_add_text(sender_jid, msg_id, sender_name, content or "", timestamp)
+                            buf = self.incoming_buffers.get(sender_jid)
+                            if buf:
+                                print(f"📝 Added to buffer (will wait {self.batch_window_sec // 60} min). Buffer now has {len(buf.get('texts', []))} message(s)", flush=True)
+                            # Do not enqueue immediately; batching will flush later
+                            continue
 
-                    # Media messages proceed as before (AI for caption context if needed)
-                    ai_reply = self.generate_ai_reply(sender_jid, content or "")
-                    print(f"🤖 AI Reply: {ai_reply}", flush=True)
-                    row_number = self.log_to_sheets(timestamp, sender_jid, sender_name, content or "", ai_reply)
-                    media_path = locals().get('media_path_for_enqueue', "") if media_type in ("image", "video", "document") else ""
-                    self.enqueue_item(msg_id, sender_jid, sender_name, content or "", media_type, media_path, ai_reply, row_number)
-                    enqueued_any = True
+                        # Media messages proceed as before (AI for caption context if needed)
+                        ai_reply = self.generate_ai_reply(sender_jid, content or "")
+                        print(f"🤖 AI Reply: {ai_reply}", flush=True)
+                        row_number = self.log_to_sheets(timestamp, sender_jid, sender_name, content or "", ai_reply)
+                        media_path = locals().get('media_path_for_enqueue', "") if media_type in ("image", "video", "document") else ""
+                        self.enqueue_item(msg_id, sender_jid, sender_name, content or "", media_type, media_path, ai_reply, row_number)
+                        enqueued_any = True
 
                 # Flush any buffered chats that are idle beyond the batch window
                 if self.incoming_buffers:
                     print(f"⏳ Checking buffers... ({len(self.incoming_buffers)} chat(s) buffered)", flush=True)
-                flushed = self._flush_ready_buffers()
-                if flushed:
-                    print(f"✅ Flushed buffered messages and sent to Telegram!", flush=True)
-                enqueued_any = enqueued_any or flushed
+                    flushed = self._flush_ready_buffers()
+                    if flushed:
+                        print(f"✅ Flushed buffered messages and sent to Telegram!", flush=True)
+                    enqueued_any = enqueued_any or flushed
 
                 # After enqueueing, if nothing was active, present the next pending now
                 if (not active_before) and enqueued_any:
