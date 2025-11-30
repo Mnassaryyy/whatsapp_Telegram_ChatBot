@@ -118,11 +118,12 @@ def _generate_ai_reply_assistants(bot, sender_jid: str, message_text: str, assis
         messages = bot.client.beta.threads.messages.list(thread_id=thread_id)
         
         # Step 6: Extract the assistant's latest message
-        for message in reversed(messages.data):
-            if message.role == "assistant":
-                if message.content and len(message.content) > 0:
-                    response_text = message.content[0].text.value
-                    return response_text
+        if messages.data and messages.data[0].role == "assistant":
+            if messages.data[0].content and len(messages.data[0].content) > 0:
+                return messages.data[0].content[0].text.value
+
+        print("⚠️  No assistant response found in thread", flush=True)
+        return None
         
         print("⚠️  No assistant response found in thread", flush=True)
         return None
