@@ -1,0 +1,63 @@
+package main
+
+import (
+	"fmt"
+
+	// Remove qrterminal import if you're not using it for terminal output
+	// qrterminal "github.com/mdp/qrterminal" // This line should be removed or commented out
+
+	qrcode "github.com/skip2/go-qrcode" // Import the qrcode package for PNG generation
+)
+
+// Assume qrChan and connected are defined elsewhere and work as before
+// For demonstration purposes, let's mock them here if they are not global or passed
+type QREvent struct {
+	Event string
+	Code  string
+}
+
+// Mock channels for demonstration; replace with your actual application's channels
+var qrChan = make(chan QREvent)
+var connected = make(chan bool)
+
+func main() {
+	// Simulate a QR code event for testing
+	go func() {
+		// Replace this mock code with the actual code from your WhatsApp library
+		qrChan <- QREvent{Event: "code", Code: "https://wa.me/some-whatsapp-link?qr_code_data"}
+	}()
+
+	// Print QR code for pairing with phone
+	for evt := range qrChan {
+		if evt.Event == "code" {
+			fmt.Println("\nGenerating QR code PNG for pairing with your WhatsApp app...")
+
+			// Define the filename for the QR code image
+			filename := "whatsapp_qr_code.png"
+
+			// Generate the QR code as a PNG image
+			// qrcode.Medium is the error correction level, 256 is the size in pixels
+			err := qrcode.WriteFile(evt.Code, qrcode.Medium, 256, filename)
+			if err != nil {
+				fmt.Printf("Error generating QR code PNG: %v\n", err)
+				// Consider if you want to exit or retry here
+				return // Exiting on error
+			}
+			fmt.Printf("QR code saved to %s\n", filename)
+			fmt.Println("You can now scan this image with your WhatsApp app.")
+
+		} else if evt.Event == "success" {
+			connected <- true
+			break
+		}
+	}
+
+	// This part is just to keep the program running for a bit if connected isn't used immediately
+	select {
+	case <-connected:
+		fmt.Println("Successfully connected!")
+	// You might want a timeout or more sophisticated handling here
+	// case <-time.After(30 * time.Second):
+	// 	fmt.Println("Timeout waiting for connection success.")
+	}
+}
